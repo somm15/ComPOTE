@@ -330,6 +330,10 @@ def get_symbol(tags, cat, col_cat=None):
         return '50'
     if cat == 'col':
         return {'HC': '66', '1': '62', '2': '63', '3': '64', '4': '65'}.get(col_cat, '105')
+    if cat == 'sprint':
+        return '19'        # sprint intermédiaire
+    if cat == 'climb_foot':
+        return '17'        # « Meilleur Grimpeur » : pied d'une ascension
     return '1'
 
 
@@ -405,6 +409,8 @@ def inject_waypoints(root, pois):
             desc_el.text = get_col_description(
                 poi['tags'], poi.get('col_cat'), poi.get('col_denivele'),
                 poi.get('col_dist'), poi.get('col_pente'), poi.get('col_score'))
+        elif 'desc' in poi:
+            desc_el.text = poi['desc']        # sprints, repères grimpeur : desc vide
         else:
             desc_el.text = get_description(poi['tags'], poi['cat'])
 
@@ -427,8 +433,47 @@ def find_km_at_point(lat, lon, track_pts, cum_dists):
     best_i = min(range(len(track_pts)), key=lambda i: haversine(lat, lon, track_pts[i][0], track_pts[i][1]))
     return cum_dists[best_i]
 
-def generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, gpx_name, out_path, logo_path=None, title=None):
-    """Génère un PDF 4x20cm avec la liste des cols pour coller sur le cadre."""
+def _draw_sprint_icon(c, x, y, s):
+    """
+    Dessine un petit cycliste en danseuse (sprint) dans un carré s×s, dont le
+    coin inférieur gauche est en (x, y). Utilisé comme pictogramme de sprint
+    intermédiaire dans le roadbook.
+    """
+    c.saveState()
+    c.setStrokeColorRGB(0.10, 0.10, 0.10)
+    c.setFillColorRGB(0.10, 0.10, 0.10)
+    c.setLineWidth(max(0.4, s * 0.05))
+    c.setLineCap(1)
+    r = s * 0.20
+    yb = y + r                                   # axe des roues
+    xrear, xfront = x + r, x + s - r
+    c.circle(xrear, yb, r, stroke=1, fill=0)
+    c.circle(xfront, yb, r, stroke=1, fill=0)
+    bb = (x + s * 0.46, yb)                      # boîtier de pédalier
+    seat = (x + s * 0.40, yb + s * 0.42)         # selle
+    bar = (xfront - s * 0.02, yb + s * 0.40)     # cintre
+    p = c.beginPath()
+    p.moveTo(*bb); p.lineTo(xrear, yb)
+    p.moveTo(*bb); p.lineTo(*seat)
+    p.moveTo(*seat); p.lineTo(*bar)
+    p.moveTo(*bb); p.lineTo(*bar)
+    p.moveTo(*bar); p.lineTo(xfront, yb)
+    c.drawPath(p, stroke=1, fill=0)
+    hip = (seat[0], seat[1] + s * 0.03)
+    shoulder = (x + s * 0.62, yb + s * 0.72)
+    head = (x + s * 0.75, yb + s * 0.82)
+    q = c.beginPath()
+    q.moveTo(*hip); q.lineTo(*shoulder)          # dos penché
+    q.moveTo(*shoulder); q.lineTo(*bar)          # bras vers le cintre
+    q.moveTo(*hip); q.lineTo(*bb)                # jambe vers le pédalier
+    c.drawPath(q, stroke=1, fill=0)
+    c.circle(head[0], head[1], s * 0.11, stroke=1, fill=1)
+    c.restoreState()
+
+
+def generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, gpx_name, out_path,
+                          logo_path=None, title=None, sprint_pois=None):
+    """Génère un PDF 3.6x20cm avec la liste des cols et sprints pour le cadre."""
     PAGE_W = 3.6 * cm
     PAGE_H = 20 * cm
     MARGIN = 3 * mm
@@ -524,9 +569,13 @@ def generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, gpx_name, out_path
     y -= 5 * mm
 
     # Sous-titre total km
+    n_sprints = len(sprint_pois or [])
     c.setFont("Helvetica", 5.5)
     c.setFillColorRGB(0.5, 0.5, 0.5)
-    c.drawCentredString(PAGE_W / 2, y - 2, f"{total_km:.0f} km — {len(cols_with_km)} col(s)")
+    sub = f"{total_km:.0f} km — {len(cols_with_km)} col(s)"
+    if n_sprints:
+        sub += f" — {n_sprints} sprint(s)"
+    c.drawCentredString(PAGE_W / 2, y - 2, sub)
     y -= 5 * mm
 
     # Séparateur
@@ -543,7 +592,54 @@ def generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, gpx_name, out_path
         'Cat. 4': (0.3, 0.6, 0.3),
     }
 
-    for col in cols_with_km:
+    # Fusionner cols et sprints en une seule liste ordonnée par kilométrage,
+    # pour que le roadbook les présente dans l'ordre de la course.
+    render_items = [{'kind': 'col', 'km': col['km_summit'], 'data': col}
+                    for col in cols_with_km]
+    for sp in (sprint_pois or []):
+        s_idx = min(range(len(track_pts)),
+                    key=lambda i: haversine(sp['lat'], sp['lon'],
+                                            track_pts[i][0], track_pts[i][1]))
+        render_items.append({'kind': 'sprint', 'km': round(cum_dists[s_idx], 1),
+                              'data': sp})
+    render_items.sort(key=lambda it: it['km'])
+
+    for item in render_items:
+        # ─── Bloc « sprint intermédiaire » ──────────────────────────────────
+        if item['kind'] == 'sprint':
+            sp = item['data']
+            icon_s = 5.5 * mm
+            _draw_sprint_icon(c, MARGIN, y - icon_s, icon_s)
+            text_x = MARGIN + icon_s + 1.5 * mm
+            c.setFillColorRGB(0.0, 0.6, 0.2)            # vert (maillot vert)
+            c.setFont("Helvetica-Bold", 5.5)
+            c.drawString(text_x, y - 2.3 * mm, "SPRINT")
+            c.drawString(text_x, y - 4.7 * mm, "INTERMÉDIAIRE")
+            c.setFillColorRGB(0.2, 0.2, 0.2)
+            c.setFont("Helvetica-Bold", 6.5)
+            c.drawRightString(PAGE_W - MARGIN, y - 2.3 * mm, f"{item['km']:.1f} km")
+            # Nom du sprint sur sa propre ligne, pleine largeur
+            c.setFillColorRGB(0.05, 0.05, 0.05)
+            c.setFont("Helvetica-Bold", 7)
+            sname = sp['name']
+            while c.stringWidth(sname, "Helvetica-Bold", 7) > PAGE_W - 2 * MARGIN \
+                    and len(sname) > 4:
+                sname = sname[:-1]
+            if sname != sp['name']:
+                sname = sname[:-1] + '.'
+            c.drawString(MARGIN, y - icon_s - 3 * mm, sname)
+            y -= icon_s + 6 * mm
+            c.setStrokeColorRGB(0.88, 0.88, 0.88)
+            c.setLineWidth(0.3)
+            c.line(MARGIN, y, PAGE_W - MARGIN, y)
+            y -= 3.5 * mm
+            if y < MARGIN + 15 * mm:
+                c.showPage()
+                y = PAGE_H - MARGIN
+            continue
+
+        # ─── Bloc col (inchangé) ────────────────────────────────────────────
+        col = item['data']
         is_intermediate = col.get('intermediate', False)
         col_cat = col.get('col_cat')
         label = 'HC' if col_cat == 'HC' else (f"Cat. {col_cat}" if col_cat else None)
@@ -1049,6 +1145,99 @@ def find_manual_name(lat, lon, manual_names, km=None,
     return best_name
 
 
+# ─── Sprints intermédiaires ──────────────────────────────────────────────────
+
+def load_sprints_csv(path):
+    """
+    Charge un CSV optionnel de sprints intermédiaires.
+
+    Format d'une ligne (sans entête, séparateur virgule) :  nom,km
+        Sprint de Gérardmer,34.2
+
+    `km` est la distance depuis le départ ; le sprint est positionné sur le
+    point du tracé correspondant. Renvoie [(nom, km), ...] ; liste vide si le
+    fichier est absent.
+    """
+    import csv
+    sprints = []
+    if not path or not os.path.isfile(path):
+        return sprints
+    try:
+        with open(path, newline='', encoding='utf-8') as f:
+            for row in csv.reader(f):
+                if len(row) < 2:
+                    continue
+                try:
+                    sprints.append((row[0].strip(), float(row[1].strip())))
+                except ValueError:
+                    continue  # entête ou ligne malformée -> ignorée
+        if sprints:
+            print(f"  {len(sprints)} sprint(s) chargé(s) depuis {path}")
+    except Exception as e:
+        print(f"  Avertissement sprints CSV: {e}")
+    return sprints
+
+
+def extract_gpx_sprints(root):
+    """
+    Repère les waypoints de sprint déjà présents dans le GPX source (symbole
+    19), les retire du document — ils seront réinjectés au format homogène —
+    et renvoie leurs données : [{'lat', 'lon', 'name'}].
+    """
+    ns = {'gpx': 'http://www.topografix.com/GPX/1/1'}
+    found = []
+    for wpt in list(root.findall('gpx:wpt', ns)):
+        sym = (wpt.findtext('gpx:sym', '', ns) or '').strip()
+        if sym != '19':
+            continue
+        name = (wpt.findtext('gpx:name', '', ns) or '').strip()
+        found.append({'lat': float(wpt.get('lat')),
+                       'lon': float(wpt.get('lon')),
+                       'name': name or 'Sprint'})
+        root.remove(wpt)
+    return found
+
+
+def point_at_km(km, track_pts, cum_dists):
+    """Coordonnées (lat, lon) du point du tracé situé à `km` du départ."""
+    if not cum_dists:
+        return None
+    km = max(0.0, min(km, cum_dists[-1]))
+    idx = min(range(len(cum_dists)), key=lambda i: abs(cum_dists[i] - km))
+    return track_pts[idx]
+
+
+def build_sprint_pois(gpx_sprints, csv_sprints, track_pts, cum_dists):
+    """
+    Construit les POIs « sprint » à partir des deux sources :
+      - gpx_sprints : sprints déjà présents dans le GPX source (positionnés) ;
+      - csv_sprints : sprints du CSV (nom, km), positionnés sur le tracé.
+    Un sprint du CSV à moins de 200 m d'un sprint du GPX est ignoré (doublon).
+    """
+    pois = []
+
+    def _add(lat, lon, name):
+        pois.append({
+            'lat': lat, 'lon': lon, 'cat': 'sprint',
+            'name': name or 'Sprint', 'desc': '',
+            'dist': min_dist_to_track(lat, lon, track_pts, step=5),
+            'tags': {}, 'col_cat': None, 'col_denivele': None,
+            'col_dist': None, 'col_pente': None, 'col_score': None,
+            'foot_lat': None, 'foot_lon': None,
+        })
+
+    for s in gpx_sprints:
+        _add(s['lat'], s['lon'], s['name'])
+    for name, km in csv_sprints:
+        pt = point_at_km(km, track_pts, cum_dists)
+        if pt is None:
+            continue
+        if any(haversine(pt[0], pt[1], p['lat'], p['lon']) < 200 for p in pois):
+            continue  # doublon avec un sprint déjà présent dans le GPX
+        _add(pt[0], pt[1], name)
+    return pois
+
+
 # ─── PDF impression A4 paysage (8 roadbooks côte à côte) ────────────────────
 
 def generate_roadbook_print_sheet(single_pdf_path, out_path):
@@ -1133,7 +1322,7 @@ def generate_roadbook_print_sheet(single_pdf_path, out_path):
 
 # ─── Traitement principal ────────────────────────────────────────────────────
 
-def process_gpx(filepath, logo_path=None, title=None):
+def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
     print(f"\n{'='*60}")
     print(f"Fichier: {filepath}")
 
@@ -1142,6 +1331,9 @@ def process_gpx(filepath, logo_path=None, title=None):
     if not track_pts:
         print("  Aucun point trouvé, fichier ignoré.")
         return
+    # Sprints déjà présents dans le GPX source (symbole 19) : retirés ici,
+    # ils seront réinjectés au format homogène avec ceux du CSV.
+    gpx_sprints = extract_gpx_sprints(root)
 
     lats = [p[0] for p in track_pts]
     lons = [p[1] for p in track_pts]
@@ -1286,9 +1478,34 @@ def process_gpx(filepath, logo_path=None, title=None):
                           'col_dist': col_dist_km, 'col_pente': pente, 'col_score': score,
                           'foot_lat': foot_lat, 'foot_lon': foot_lon})
 
-    counts = {c: sum(1 for p in pois if p['cat']==c) for c in ('water','food','shop','col')}  # col_invalid not counted
+    # ─── Sprints : repris du GPX source (symbole 19) + ajoutés depuis le CSV ─
+    cum_dists_full = compute_cumulative_distances(track_pts)
+    csv_sprints = load_sprints_csv(sprints_csv or SPRINTS_FILE)
+    sprint_pois = build_sprint_pois(gpx_sprints, csv_sprints, track_pts, cum_dists_full)
+    pois.extend(sprint_pois)
+    for sp in sprint_pois:
+        skm = find_km_at_point(sp['lat'], sp['lon'], track_pts, cum_dists_full)
+        print(f"  Sprint: {sp['name']} @ {skm:.1f}km")
+
+    # ─── Repère « Meilleur Grimpeur » au pied de chaque ascension classée ────
+    # (point de départ pris en compte pour la durée d'ascension du col)
+    foot_pois = []
+    for p in pois:
+        if p['cat'] == 'col' and p.get('foot_lat') is not None:
+            foot_pois.append({
+                'lat': p['foot_lat'], 'lon': p['foot_lon'], 'cat': 'climb_foot',
+                'name': 'Meilleur Grimpeur', 'desc': '', 'dist': 0.0, 'tags': {},
+                'col_cat': None, 'col_denivele': None, 'col_dist': None,
+                'col_pente': None, 'col_score': None,
+                'foot_lat': None, 'foot_lon': None,
+            })
+    pois.extend(foot_pois)
+
+    counts = {c: sum(1 for p in pois if p['cat'] == c)
+              for c in ('water', 'food', 'shop', 'col', 'sprint')}  # col_invalid not counted
     print(f"  POIs retenus: {len(pois)} total "
-          f"(eau: {counts['water']}, resto: {counts['food']}, épicerie: {counts['shop']}, cols: {counts['col']})")
+          f"(eau: {counts['water']}, resto: {counts['food']}, épicerie: {counts['shop']}, "
+          f"cols: {counts['col']}, sprints: {counts['sprint']})")
     for p in [x for x in pois if x['cat'] == 'col']:
         if p.get('col_cat'):
             label = 'HC' if p['col_cat'] == 'HC' else f"Cat. {p['col_cat']}"
@@ -1304,15 +1521,16 @@ def process_gpx(filepath, logo_path=None, title=None):
     tree.write(out_path, encoding='utf-8', xml_declaration=True)
     print(f"  Sauvegardé: {out_path}")
 
-    # Générer le PDF roadbook si des cols ont été trouvés
+    # Générer le PDF roadbook si des cols ou des sprints ont été trouvés
     col_pois = [p for p in pois if p['cat'] == 'col']  # col_invalid already excluded
-    if col_pois:
+    if col_pois or sprint_pois:
         pdf_path = filepath.replace('.gpx', '_roadbook.pdf')
-        generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, filepath, pdf_path, logo_path=logo_path, title=title)
+        generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, filepath, pdf_path,
+                              logo_path=logo_path, title=title, sprint_pois=sprint_pois)
         print_path = filepath.replace('.gpx', '_roadbook_impression.pdf')
         generate_roadbook_print_sheet(pdf_path, print_path)
     else:
-        print("  Aucun col trouvé, pas de PDF roadbook généré.")
+        print("  Aucun col ni sprint trouvé, pas de PDF roadbook généré.")
 
     return len(pois)
 
@@ -1326,9 +1544,10 @@ if __name__ == '__main__':
         prog='enrichir_gpx.py',
         description=(
             "Enrichit des fichiers GPX avec des POIs OpenStreetMap (eau potable, restaurants,\n"
-            "épiceries, cols) et génère deux fichiers par GPX :\n"
+            "épiceries, cols), des sprints intermédiaires et des repères de pied d'ascension,\n"
+            "puis génère trois fichiers par GPX :\n"
             "  • <nom>_enrichi.gpx      — fichier GPX avec waypoints POI\n"
-            "  • <nom>_roadbook.pdf     — carton 3.6×20cm à coller sur le cadre (cols + stats)\n"
+            "  • <nom>_roadbook.pdf     — carton 3.6×20cm à coller sur le cadre (cols + sprints)\n"
             "  • <nom>_roadbook_impression.pdf — A4 paysage, 8 roadbooks côte à côte avec lignes de coupe"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1337,6 +1556,7 @@ if __name__ == '__main__':
             "  python enrichir_gpx.py mon_trajet.gpx\n"
             "  python enrichir_gpx.py *.gpx --titre \"Étape 1 — Col Attitude\"\n"
             "  python enrichir_gpx.py tour.gpx --logo logo.png --titre \"Groupetto 2025\"\n"
+            "  python enrichir_gpx.py etape.gpx --sprints sprints.csv\n"
             "  # Moyenne montagne (Ardennes) — détecter les côtes basses :\n"
             "  python enrichir_gpx.py lbl.gpx --col-prominence 40 --col-isolation 0.8\n"
             "\n"
@@ -1348,7 +1568,15 @@ if __name__ == '__main__':
             "    • par coordonnées :  47.9763118,6.7561008,Col de la Burotte\n"
             "    • par kilométrage :  km,89.6,Côte de la Redoute\n"
             "  Le format « km » est le plus simple : relevez le kilométrage\n"
-            "  affiché pour chaque « Sommet (...) » détecté, puis ajoutez une ligne."
+            "  affiché pour chaque « Sommet (...) » détecté, puis ajoutez une ligne.\n"
+            "\n"
+            "Sprints intermédiaires (optionnel) :\n"
+            "  • Les waypoints du GPX source portant le symbole 19 sont repris.\n"
+            "  • Un CSV « nom,km » (option --sprints, ou sprints.csv par défaut)\n"
+            "    ajoute des sprints positionnés sur le tracé.\n"
+            "  Les sprints sont écrits dans le GPX (symbole 19) et figurent dans\n"
+            "  le roadbook. Chaque pied d'ascension reçoit en plus un repère\n"
+            "  « Meilleur Grimpeur » (symbole 17)."
         )
     )
     parser.add_argument(
@@ -1381,6 +1609,13 @@ if __name__ == '__main__':
               f"(défaut : {PEAK_ISOLATION_KM:.1f}). Baisser quand les côtes "
               "s'enchaînent (Ardennes), monter pour les regrouper.")
     )
+    parser.add_argument(
+        '--sprints', metavar='CSV',
+        help=("Fichier CSV de sprints intermédiaires à ajouter (format : "
+              f"nom,km). Par défaut, « {SPRINTS_FILE} » est lu s'il existe. "
+              "Les sprints déjà présents dans le GPX source (symbole 19) sont "
+              "de toute façon repris.")
+    )
     args = parser.parse_args()
 
     # Surcharge éventuelle des paramètres de détection des cols par la ligne
@@ -1412,7 +1647,8 @@ if __name__ == '__main__':
 
     total = 0
     for i, f in enumerate(files):
-        total += process_gpx(f, logo_path=logo_path, title=custom_title) or 0
+        total += process_gpx(f, logo_path=logo_path, title=custom_title,
+                              sprints_csv=args.sprints) or 0
         if i < len(files) - 1:
             time.sleep(1)  # pause entre requêtes Overpass
 
