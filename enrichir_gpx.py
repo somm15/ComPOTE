@@ -57,6 +57,54 @@ PEAK_PROM_SEARCH_KM = 5.0     # distance (km) explorée de chaque côté pour
                               #   mesurer la proéminence.
 PEAK_SMOOTH_WINDOW  = 15      # demi-fenêtre de lissage du profil altimétrique
                               #   (points), pour filtrer le bruit des altitudes.
+PEAK_TWIN_TOLERANCE = 30      # « sommets jumeaux » : un sommet de faible
+                              #   proéminence est tout de même retenu si le
+                              #   sommet voisin plus haut qui éclipse sa
+                              #   proéminence ne le dépasse pas de plus de cette
+                              #   valeur (m) — il s'agit alors de deux vrais
+                              #   sommets voisins, pas d'un simple épaulement.
+PEAK_TWIN_MIN_DROP  = 12      # creux minimal (m) exigé entre deux tels jumeaux.
+
+# ─── Pied d'ascension strict (option --climb-foot-strict) ────────────────────
+# Condition supplémentaire OPTIONNELLE sur le pied d'une ascension. Lorsqu'elle
+# est activée (drapeau --climb-foot-strict), le pied déterminé classiquement est
+# AVANCÉ vers le sommet jusqu'au premier endroit à partir duquel la montée est
+# « franche » : les CLIMB_FOOT_STRICT_DIST_M mètres qui suivent doivent grimper
+# à au moins CLIMB_FOOT_STRICT_GRADIENT %. Cela écarte les faux-plats et les
+# approches roulantes que la détection altimétrique inclut parfois dans la
+# montée. Sans le drapeau, le comportement reste strictement inchangé.
+CLIMB_FOOT_STRICT          = False   # activé par --climb-foot-strict
+CLIMB_FOOT_STRICT_DIST_M   = 100.0   # longueur du passage de contrôle (m)
+CLIMB_FOOT_STRICT_GRADIENT = 3.0     # pente minimale de ce passage (%)
+
+# ─── Creux intermédiaire toléré dans une ascension ───────────────────────────
+# Une ascension peut comporter un creux intermédiaire (faux-plat descendant,
+# court replat) sans pour autant être scindée en deux. Lors de la recherche du
+# pied, un tel creux est franchi si la bosse intermédiaire ne dépasse pas le
+# creux de plus de COL_MAX_INTERMEDIATE_DESCENT mètres ET qu'une vallée plus
+# basse se trouve au-delà. Au-delà de ce seuil, on considère qu'il s'agit de
+# deux ascensions distinctes. Augmenter cette valeur fusionne davantage les
+# montées en relief vallonné ; la diminuer les sépare.
+COL_MAX_INTERMEDIATE_DESCENT = 45.0  # mètres
+
+# ─── Faux-plat d'élan en amont d'une ascension ───────────────────────────────
+# Un col est parfois précédé d'un long replat / faux-plat (plusieurs km quasi
+# horizontaux) qui ne fait pas partie de l'ascension. Lors de la recherche du
+# pied, si l'on rencontre en remontant une section d'au moins COL_FLAT_RUNUP_M
+# mètres dont la pente moyenne reste sous COL_FLAT_MAX_GRADIENT %, on considère
+# que l'ascension commence à l'extrémité « haute » de ce replat : le pied y est
+# fixé et la recherche s'arrête. Mettre COL_FLAT_RUNUP_M très grand désactive
+# en pratique ce comportement.
+COL_FLAT_RUNUP_M     = 1500.0  # longueur mini d'un replat d'élan (m)
+COL_FLAT_MAX_GRADIENT = 3.0    # pente moyenne maxi d'un tel replat (%)
+
+# ─── Seuils minimaux pour qu'une montée soit une « ascension » ───────────────
+# Une montée détectée n'est retenue comme ascension (et donc inscrite comme col
+# dans le GPX) que si elle dépasse simultanément ces trois seuils. Sinon elle
+# est ignorée — un long faux-plat à 1 % n'est pas une ascension.
+COL_MIN_DENIVELE = 30.0   # dénivelé minimal (m)
+COL_MIN_LENGTH   = 100.0  # longueur minimale (m)
+COL_MIN_GRADIENT = 4.0    # pente moyenne minimale (%)
 
 # ─── Nommage des cols / côtes détectés ───────────────────────────────────────
 # Mots-clés qui, présents dans le nom OSM d'une voie ou d'un lieu, indiquent
@@ -119,17 +167,56 @@ def smooth_eles(arr, w=8):
     return [sum(arr[max(0,i-w):i+w+1]) / len(arr[max(0,i-w):i+w+1]) for i in range(len(arr))]
 
 
+def _strict_climb_foot(seg_track, sm, foot_local):
+    """
+    Affine le pied d'une ascension (option --climb-foot-strict).
+
+    Procédure : à partir du pied déterminé classiquement (`foot_local`), on
+    REMONTE la montée point par point jusqu'au premier endroit à partir duquel
+    les CLIMB_FOOT_STRICT_DIST_M mètres suivants grimpent à une pente moyenne
+    d'au moins CLIMB_FOOT_STRICT_GRADIENT %. Ce point devient le nouveau pied :
+    les faux-plats d'approche sont ainsi exclus de la montée.
+
+    Paramètres :
+      seg_track  : sous-liste (lat, lon, ele) du tracé, du début de la fenêtre
+                   de recherche jusqu'au sommet ;
+      sm         : altitudes lissées correspondantes (même longueur) ;
+      foot_local : index, dans ce segment, du pied déterminé classiquement.
+    Renvoie l'index (dans le segment) du pied affiné. Si aucun passage ne
+    satisfait le critère, le pied classique est conservé.
+    """
+    n = len(sm) - 1
+    for c in range(foot_local, n):
+        # Avancer depuis c jusqu'à couvrir la distance de contrôle.
+        acc, e = 0.0, c
+        while e < n and acc < CLIMB_FOOT_STRICT_DIST_M:
+            acc += haversine(seg_track[e][0], seg_track[e][1],
+                             seg_track[e + 1][0], seg_track[e + 1][1])
+            e += 1
+        if acc < CLIMB_FOOT_STRICT_DIST_M:
+            break  # plus assez de marge avant le sommet
+        gradient = (sm[e] - sm[c]) / acc * 100.0
+        if gradient >= CLIMB_FOOT_STRICT_GRADIENT:
+            return c
+    return foot_local
+
+
 def classify_col(summit_lat, summit_lon, summit_ele, track_pts_with_ele, start_limit_idx=0):
     """
     Calcule les stats de la montée menant au col.
     Le pied ne peut pas remonter avant start_limit_idx (sommet du col précédent).
     Remonte depuis le sommet en cherchant le minimum, s'arrête sur une bosse > DROP_M.
+
+    Si l'option CLIMB_FOOT_STRICT est active, le pied ainsi obtenu est ensuite
+    avancé vers le sommet jusqu'au premier passage « franc » (cf.
+    _strict_climb_foot) ; les statistiques de la montée sont alors recalculées
+    à partir de ce pied affiné.
     """
     if not summit_ele or not track_pts_with_ele:
         return None, None, None, None, None, None, None
 
-    DROP_M   = 30   # tolérance pour les petites bosses dans la montée (m)
-    MIN_CLIMB = 30  # dénivelé minimum pour une vraie montée (m)
+    DROP_M    = 30                  # tolérance pour les petites bosses (m)
+    MIN_CLIMB = COL_MIN_DENIVELE    # dénivelé minimum pour une vraie montée (m)
 
     # Trouver le point le plus proche du col sur le tracé
     best_idx = min(range(len(track_pts_with_ele)),
@@ -147,20 +234,87 @@ def classify_col(summit_lat, summit_lon, summit_ele, track_pts_with_ele, start_l
     min_val    = sm[n]
     foot_local = n
 
+    # Distances cumulées le long du segment de recherche.
+    seg_track = track_pts_with_ele[start:best_idx + 1]
+    seg_cum = [0.0]
+    for i in range(1, len(seg_track)):
+        seg_cum.append(seg_cum[-1] + haversine(seg_track[i - 1][0], seg_track[i - 1][1],
+                                               seg_track[i][0], seg_track[i][1]))
+
+    def _local_grad(j):
+        """Pente locale (%) sur une fenêtre d'environ 250 m centrée sur j."""
+        a, b = j, j
+        while a > 0 and (seg_cum[j] - seg_cum[a]) < 125.0:
+            a -= 1
+        while b < n and (seg_cum[b] - seg_cum[j]) < 125.0:
+            b += 1
+        d = seg_cum[b] - seg_cum[a]
+        return (sm[b] - sm[a]) / d * 100.0 if d > 0 else 0.0
+
+    # ─── Passe A — faux-plat d'élan ──────────────────────────────────────────
+    # On descend depuis le sommet en suivant la pente locale. Si l'on rencontre
+    # un replat CONTINU d'au moins COL_FLAT_RUNUP_M (pente locale toujours sous
+    # COL_FLAT_MAX_GRADIENT), l'ascension est réputée commencer en haut de ce
+    # replat : le long faux-plat d'approche n'en fait pas partie. Un court
+    # replat (replat de respiration d'un col) ne déclenche rien : il faut une
+    # longueur continue.
+    flat_foot, flat_start = None, None
     for j in range(n - 1, -1, -1):
-        if sm[j] < min_val:
-            min_val    = sm[j]
-            foot_local = j
-        elif sm[j] > min_val + DROP_M:
-            break
+        if _local_grad(j) < COL_FLAT_MAX_GRADIENT:
+            if flat_start is None:
+                flat_start = j
+            if (seg_cum[flat_start] - seg_cum[j]) >= COL_FLAT_RUNUP_M:
+                if (summit_ele - sm[flat_start]) >= MIN_CLIMB:
+                    flat_foot = flat_start
+                break
+        else:
+            flat_start = None
+
+    if flat_foot is not None:
+        foot_local = flat_foot
+    else:
+        # ─── Passe B — minimum d'altitude et creux intermédiaires ────────────
+        # On suit le minimum d'altitude. Lorsqu'on rencontre une remontée de
+        # plus de DROP_M au-dessus du point bas courant, on ne s'arrête pas
+        # aussitôt : une ascension peut comporter un creux intermédiaire. On
+        # regarde plus loin (« lookahead ») : si une vallée plus basse existe
+        # au-delà de la bosse, et que cette bosse ne dépasse pas le creux de
+        # plus de COL_MAX_INTERMEDIATE_DESCENT mètres, le creux est franchi ;
+        # sinon le vrai pied est atteint.
+        j = n - 1
+        while j >= 0:
+            if sm[j] < min_val:
+                min_val, foot_local = sm[j], j
+                j -= 1
+                continue
+            if sm[j] > min_val + DROP_M:
+                peak, k, deeper = sm[j], j, None
+                while k >= 0:
+                    peak = max(peak, sm[k])
+                    if peak > min_val + COL_MAX_INTERMEDIATE_DESCENT:
+                        break                  # bosse trop haute : ascension distincte
+                    if sm[k] < min_val:
+                        deeper = k              # vallée plus basse au-delà du creux
+                        break
+                    k -= 1
+                if deeper is None:
+                    break                      # vrai pied de l'ascension atteint
+                min_val, foot_local = sm[deeper], deeper
+                j = deeper - 1
+                continue
+            j -= 1
+
+    # Option : avancer le pied jusqu'au premier passage franc (>= X % sur Y m).
+    if CLIMB_FOOT_STRICT:
+        foot_local = _strict_climb_foot(seg_track, sm, foot_local)
 
     foot_idx = start + foot_local
     foot_lat, foot_lon = track_pts_with_ele[foot_idx][0], track_pts_with_ele[foot_idx][1]
 
     foot_ele = track_pts_with_ele[foot_idx][2]
     denivele = summit_ele - foot_ele
-    if denivele < MIN_CLIMB:
-        # Col en descente ou trop petit — ignorer
+    if denivele < COL_MIN_DENIVELE:
+        # Col en descente ou dénivelé trop faible — pas une ascension.
         return None, None, None, None, None, None, None
 
     dist_m = sum(
@@ -169,10 +323,14 @@ def classify_col(summit_lat, summit_lon, summit_ele, track_pts_with_ele, start_l
         for i in range(foot_idx, best_idx)
         if i + 1 < len(track_pts_with_ele)
     )
-    if dist_m < 100:
-        return None, None, None, None, None, None, None
+    if dist_m < COL_MIN_LENGTH:
+        return None, None, None, None, None, None, None   # trop courte
 
     pente_moy   = (denivele / dist_m) * 100
+    if pente_moy < COL_MIN_GRADIENT:
+        # Pente moyenne trop faible : un long faux-plat n'est pas une ascension.
+        return None, None, None, None, None, None, None
+
     coefficient = round((pente_moy ** 2) * (dist_m / 1000), 1)
 
     if coefficient >= 600:   cat = 'HC'
@@ -435,39 +593,64 @@ def find_km_at_point(lat, lon, track_pts, cum_dists):
 
 def _draw_sprint_icon(c, x, y, s):
     """
-    Dessine un petit cycliste en danseuse (sprint) dans un carré s×s, dont le
-    coin inférieur gauche est en (x, y). Utilisé comme pictogramme de sprint
-    intermédiaire dans le roadbook.
+    Dessine un cycliste de course (pictogramme plein, façon panneau cyclable),
+    fortement penché en avant — utilisé comme pictogramme de sprint dans le
+    roadbook. `s` est la LARGEUR de la boîte ; la hauteur dessinée vaut environ
+    0.69*s. Le coin inférieur gauche du dessin est en (x, y).
     """
+    W = s
     c.saveState()
-    c.setStrokeColorRGB(0.10, 0.10, 0.10)
-    c.setFillColorRGB(0.10, 0.10, 0.10)
-    c.setLineWidth(max(0.4, s * 0.05))
-    c.setLineCap(1)
-    r = s * 0.20
-    yb = y + r                                   # axe des roues
-    xrear, xfront = x + r, x + s - r
-    c.circle(xrear, yb, r, stroke=1, fill=0)
-    c.circle(xfront, yb, r, stroke=1, fill=0)
-    bb = (x + s * 0.46, yb)                      # boîtier de pédalier
-    seat = (x + s * 0.40, yb + s * 0.42)         # selle
-    bar = (xfront - s * 0.02, yb + s * 0.40)     # cintre
-    p = c.beginPath()
-    p.moveTo(*bb); p.lineTo(xrear, yb)
-    p.moveTo(*bb); p.lineTo(*seat)
-    p.moveTo(*seat); p.lineTo(*bar)
-    p.moveTo(*bb); p.lineTo(*bar)
-    p.moveTo(*bar); p.lineTo(xfront, yb)
-    c.drawPath(p, stroke=1, fill=0)
-    hip = (seat[0], seat[1] + s * 0.03)
-    shoulder = (x + s * 0.62, yb + s * 0.72)
-    head = (x + s * 0.75, yb + s * 0.82)
-    q = c.beginPath()
-    q.moveTo(*hip); q.lineTo(*shoulder)          # dos penché
-    q.moveTo(*shoulder); q.lineTo(*bar)          # bras vers le cintre
-    q.moveTo(*hip); q.lineTo(*bb)                # jambe vers le pédalier
-    c.drawPath(q, stroke=1, fill=0)
-    c.circle(head[0], head[1], s * 0.11, stroke=1, fill=1)
+    c.setFillColorRGB(0.07, 0.07, 0.07)
+    c.setStrokeColorRGB(0.07, 0.07, 0.07)
+    c.setLineCap(1)      # bouts ronds
+    c.setLineJoin(1)     # jointures rondes
+
+    R = 0.205 * W
+    yc = y + R                                   # hauteur des moyeux
+    x_rear, x_front = x + R, x + W - R
+    bb     = (x + 0.45 * W, y + 0.21 * W)        # boîtier de pédalier
+    saddle = (x + 0.35 * W, y + 0.41 * W)        # selle
+    bar    = (x + 0.72 * W, y + 0.41 * W)        # cintre
+
+    # Cadre — traits épais
+    c.setLineWidth(0.060 * W)
+    fr = c.beginPath()
+    fr.moveTo(x_rear, yc); fr.lineTo(*bb)        # base arrière
+    fr.moveTo(*bb);        fr.lineTo(*saddle)    # tube de selle
+    fr.moveTo(*saddle);    fr.lineTo(*bar)       # tube supérieur
+    fr.moveTo(*bb);        fr.lineTo(*bar)       # tube diagonal
+    fr.moveTo(*saddle);    fr.lineTo(x_rear, yc) # haubans
+    fr.moveTo(*bar);       fr.lineTo(x_front, yc)# fourche
+    c.drawPath(fr, stroke=1, fill=0)
+
+    # Manivelle + pédale
+    pedal = (bb[0] + 0.05 * W, bb[1] - 0.10 * W)
+    c.setLineWidth(0.05 * W)
+    cr = c.beginPath(); cr.moveTo(*bb); cr.lineTo(*pedal)
+    c.drawPath(cr, stroke=1, fill=0)
+
+    # Roues — anneaux fins
+    c.setLineWidth(0.050 * W)
+    c.circle(x_rear,  yc, R, stroke=1, fill=0)
+    c.circle(x_front, yc, R, stroke=1, fill=0)
+
+    # Jambe — trait épais hanche → genou → pédale
+    hip  = (x + 0.37 * W, y + 0.45 * W)
+    knee = (x + 0.46 * W, y + 0.31 * W)
+    c.setLineWidth(0.085 * W)
+    lg = c.beginPath(); lg.moveTo(*hip); lg.lineTo(*knee); lg.lineTo(*pedal)
+    c.drawPath(lg, stroke=1, fill=0)
+
+    # Corps — dos + bras en un seul trait épais (le sommet à l'épaule)
+    shoulder = (x + 0.585 * W, y + 0.55 * W)
+    hand     = (x + 0.72 * W,  y + 0.41 * W)
+    c.setLineWidth(0.100 * W)
+    bd = c.beginPath()
+    bd.moveTo(*hip); bd.lineTo(*shoulder); bd.lineTo(*hand)
+    c.drawPath(bd, stroke=1, fill=0)
+
+    # Tête — disque plein
+    c.circle(x + 0.74 * W, y + 0.60 * W, 0.082 * W, stroke=0, fill=1)
     c.restoreState()
 
 
@@ -608,13 +791,14 @@ def generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, gpx_name, out_path
         # ─── Bloc « sprint intermédiaire » ──────────────────────────────────
         if item['kind'] == 'sprint':
             sp = item['data']
-            icon_s = 5.5 * mm
-            _draw_sprint_icon(c, MARGIN, y - icon_s, icon_s)
-            text_x = MARGIN + icon_s + 1.5 * mm
+            icon_w = 8.5 * mm
+            icon_h = icon_w * 0.69
+            _draw_sprint_icon(c, MARGIN, y - icon_h, icon_w)
+            text_x = MARGIN + icon_w + 1.8 * mm
             c.setFillColorRGB(0.0, 0.6, 0.2)            # vert (maillot vert)
-            c.setFont("Helvetica-Bold", 5.5)
+            c.setFont("Helvetica-Bold", 6)
             c.drawString(text_x, y - 2.3 * mm, "SPRINT")
-            c.drawString(text_x, y - 4.7 * mm, "INTERMÉDIAIRE")
+            c.drawString(text_x, y - 5.0 * mm, "INTERMÉDIAIRE")
             c.setFillColorRGB(0.2, 0.2, 0.2)
             c.setFont("Helvetica-Bold", 6.5)
             c.drawRightString(PAGE_W - MARGIN, y - 2.3 * mm, f"{item['km']:.1f} km")
@@ -627,8 +811,8 @@ def generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, gpx_name, out_path
                 sname = sname[:-1]
             if sname != sp['name']:
                 sname = sname[:-1] + '.'
-            c.drawString(MARGIN, y - icon_s - 3 * mm, sname)
-            y -= icon_s + 6 * mm
+            c.drawString(MARGIN, y - icon_h - 3 * mm, sname)
+            y -= icon_h + 6 * mm
             c.setStrokeColorRGB(0.88, 0.88, 0.88)
             c.setLineWidth(0.3)
             c.line(MARGIN, y, PAGE_W - MARGIN, y)
@@ -799,9 +983,25 @@ def detect_track_peaks(track_pts_ele, cum_km):
         plo, phi = _km_window(cum_km, i, PEAK_PROM_SEARCH_KM)
         left_min  = min(sm[plo:i + 1])
         right_min = min(sm[i:phi + 1])
-        prominence = sm[i] - max(left_min, right_min)
+        left_drop, right_drop = sm[i] - left_min, sm[i] - right_min
+        prominence = min(left_drop, right_drop)
         if prominence < PEAK_MIN_PROMINENCE:
-            continue
+            # Exception « sommets jumeaux » : un sommet qui coiffe une vraie
+            # ascension d'un côté peut avoir une faible proéminence de l'autre
+            # côté uniquement parce qu'un sommet voisin de hauteur comparable
+            # le suit (creux peu profond entre les deux). On le conserve alors
+            # comme sommet à part entière. En revanche, si le sommet voisin est
+            # nettement plus haut, ce point n'est qu'un épaulement : on l'écarte.
+            big_drop, small_drop = max(left_drop, right_drop), prominence
+            if small_drop == right_drop:
+                higher = max(sm[i:phi + 1])          # côté limitant = aval
+            else:
+                higher = max(sm[plo:i + 1])          # côté limitant = amont
+            twin = (big_drop  >= PEAK_MIN_PROMINENCE
+                    and small_drop >= PEAK_TWIN_MIN_DROP
+                    and higher <= sm[i] + PEAK_TWIN_TOLERANCE)
+            if not twin:
+                continue
 
         # Dédoublonnage : ignorer si un sommet déjà retenu est trop proche
         km = cum_km[i]
@@ -1395,12 +1595,21 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
     if track_pts_ele:
         cum_km_list = compute_cumulative_distances(track_pts)
         gpx_peaks = detect_track_peaks(track_pts_ele, cum_km_list)
+        # Rayon d'exclusion : un sommet GPX trop proche d'un col OSM est ignoré
+        # (le col OSM prime, même si sa prominence GPX serait insuffisante).
+        osm_col_kms = [
+            cum_km_list[p['_s_idx']] if '_s_idx' in p
+            else cum_km_list[min(range(len(track_pts_ele)),
+                 key=lambda i: haversine(p['lat'], p['lon'],
+                                         track_pts_ele[i][0], track_pts_ele[i][1]))]
+            for p in col_pois_unsorted
+        ]
         for peak in gpx_peaks:
             peak_km = cum_km_list[peak['_s_idx']]
-            # Points de la montée vers ce sommet (pour chercher un nom le long
-            # de la côte, pas seulement au point culminant).
             approach = _climb_approach(track_pts, cum_km_list, peak['_s_idx'])
-            # Chercher le POI OSM le plus proche dans les 500m
+
+            # Chercher le col OSM le plus proche (distance géographique ≤ 500m
+            # OU distance sur le tracé < PEAK_ISOLATION_KM)
             covering_poi = None
             best_cover_dist = 500
             for p in col_pois_unsorted:
@@ -1409,9 +1618,20 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
                     best_cover_dist = d
                     covering_poi = p
 
+            # Règle supplémentaire : si un col OSM est à moins de
+            # PEAK_ISOLATION_KM sur le tracé, le sommet GPX est ignoré même
+            # s'il est géographiquement un peu plus loin (ex : Burotte vs
+            # Ballons — le nœud OSM de la Burotte prime sur le pic GPX des
+            # Ballons détecté dans la même fenêtre d'isolation).
+            if covering_poi is None:
+                for p, okm in zip(col_pois_unsorted, osm_col_kms):
+                    if abs(peak_km - okm) < PEAK_ISOLATION_KM:
+                        covering_poi = p
+                        break
+
             if covering_poi is not None:
-                # Pic couvert par un POI OSM : ignorer le pic GPX,
-                # mais s'assurer que le POI OSM a un bon nom
+                # Pic couvert par un col OSM : ignorer le pic GPX,
+                # mais s'assurer que le col OSM a un bon nom
                 if covering_poi['name'] in ('Col', 'Sommet'):
                     manual = find_manual_name(covering_poi['lat'], covering_poi['lon'],
                                               manual_names, km=peak_km)
@@ -1422,7 +1642,7 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
                         if nearby:
                             covering_poi['name'] = nearby
             else:
-                # Pic GPX non couvert : chercher un nom et l'ajouter
+                # Pic GPX non couvert par aucun col OSM : chercher un nom et l'ajouter
                 osm_name = find_manual_name(peak['lat'], peak['lon'],
                                             manual_names, km=peak_km)
                 if not osm_name:
@@ -1441,14 +1661,13 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
                 p['_s_idx'] = min(range(len(track_pts_ele)),
                     key=lambda i: haversine(p['lat'], p['lon'], track_pts_ele[i][0], track_pts_ele[i][1]))
 
-        # Séparer cols OSM et pics GPX — traiter les OSM en premier
-        # pour que leur start_limit_idx ne soit pas pollué par les pics GPX
-        osm_cols  = [p for p in col_pois_unsorted if p.get('tags', {}).get('source') != 'gpx_peak']
-        gpx_peaks_cl = [p for p in col_pois_unsorted if p.get('tags', {}).get('source') == 'gpx_peak']
-
-        osm_cols.sort(key=lambda p: p['_s_idx'])
+        # Classer TOUS les cols (OSM comme pics du tracé) dans l'ordre du
+        # parcours, en chaînant start_limit_idx : le pied d'une ascension ne
+        # peut pas remonter avant le sommet de l'ascension précédente — sinon
+        # une ascension « engloberait » la précédente, son plat et sa descente.
+        all_cols = sorted(col_pois_unsorted, key=lambda p: p['_s_idx'])
         prev_summit_idx = 0
-        for p in osm_cols:
+        for p in all_cols:
             ele = track_pts_ele[p['_s_idx']][2]
             col_cat, denivele, col_dist_km, pente, score, foot_lat, foot_lon = \
                 classify_col(p['lat'], p['lon'], ele, track_pts_ele,
@@ -1459,24 +1678,9 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
                 p.update({'col_cat': col_cat, 'col_denivele': denivele,
                           'col_dist': col_dist_km, 'col_pente': pente, 'col_score': score,
                           'foot_lat': foot_lat, 'foot_lon': foot_lon})
+            # Le sommet borne la recherche du col suivant, même si cette montée
+            # a été rejetée : il s'agit tout de même d'un point haut du tracé.
             prev_summit_idx = p['_s_idx']
-
-        # Traiter les pics GPX : leur start_limit_idx est le dernier col OSM valide avant eux
-        for p in gpx_peaks_cl:
-            prev_osm_idx = 0
-            for osm in osm_cols:
-                if osm['_s_idx'] < p['_s_idx'] and osm.get('cat') != 'col_invalid':
-                    prev_osm_idx = osm['_s_idx']
-            ele = track_pts_ele[p['_s_idx']][2]
-            col_cat, denivele, col_dist_km, pente, score, foot_lat, foot_lon = \
-                classify_col(p['lat'], p['lon'], ele, track_pts_ele,
-                             start_limit_idx=prev_osm_idx)
-            if col_dist_km is None:
-                p['cat'] = 'col_invalid'
-            else:
-                p.update({'col_cat': col_cat, 'col_denivele': denivele,
-                          'col_dist': col_dist_km, 'col_pente': pente, 'col_score': score,
-                          'foot_lat': foot_lat, 'foot_lon': foot_lon})
 
     # ─── Sprints : repris du GPX source (symbole 19) + ajoutés depuis le CSV ─
     cum_dists_full = compute_cumulative_distances(track_pts)
@@ -1616,6 +1820,13 @@ if __name__ == '__main__':
               "Les sprints déjà présents dans le GPX source (symbole 19) sont "
               "de toute façon repris.")
     )
+    parser.add_argument(
+        '--climb-foot-strict', action='store_true',
+        help=("Affine le pied de chaque ascension : il est avancé vers le "
+              f"sommet jusqu'au premier passage de {CLIMB_FOOT_STRICT_DIST_M:.0f} m "
+              f"à au moins {CLIMB_FOOT_STRICT_GRADIENT:.0f} %% (les faux-plats "
+              "d'approche sont exclus). Sans ce drapeau, le calcul est inchangé.")
+    )
     args = parser.parse_args()
 
     # Surcharge éventuelle des paramètres de détection des cols par la ligne
@@ -1626,6 +1837,11 @@ if __name__ == '__main__':
         PEAK_MIN_ELEVATION = args.col_altitude_min
     if args.col_isolation is not None:
         PEAK_ISOLATION_KM = args.col_isolation
+    if args.climb_foot_strict:
+        CLIMB_FOOT_STRICT = True
+        print(f"Pied d'ascension strict activé "
+              f"(≥ {CLIMB_FOOT_STRICT_GRADIENT:.0f} % sur "
+              f"{CLIMB_FOOT_STRICT_DIST_M:.0f} m).")
 
     files = args.files if args.files else glob.glob('*.gpx')
     if not files:

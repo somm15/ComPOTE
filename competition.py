@@ -6,34 +6,64 @@ competition.py — Gestionnaire de compétition cycliste sur tracés GPX enrichi
 
 Ce script gère une compétition (« race ») composée d'une ou plusieurs étapes.
 Chaque étape est définie par un GPX enrichi (produit par enrichir_gpx.py), qui
-contient le tracé de référence et des waypoints de cols catégorisés.
+contient le tracé de référence, des waypoints de cols catégorisés et des
+waypoints de sprints intermédiaires (symbole 19).
 
 Les participants enregistrent leur passage en fournissant leur propre trace GPX
-(« recording »). Le script :
+(« recording »). Le script vérifie que le participant a bien suivi le tracé de
+l'étape (avec une marge d'erreur paramétrable, les GPS n'étant pas parfaits),
+puis calcule trois classements.
 
-  1. vérifie que le participant a bien suivi le tracé de l'étape (avec une marge
-     d'erreur paramétrable, les GPS n'étant pas parfaits) ;
-  2. calcule le temps d'ascension de chaque col classé ;
-  3. calcule le temps de parcours de l'étape ;
-  4. produit deux classements :
-       • le classement de la montagne (« maillot à pois »), par points ;
-       • le classement général (« maillot jaune »), par temps.
-  5. agrège ces classements sur l'ensemble de la compétition.
+Modèle de données
+-----------------
+    Compétition  : un nom ; contient plusieurs étapes et plusieurs participants.
+    Étape        : un nom + un GPX de tracé ; appartient à une compétition ;
+                   contient plusieurs enregistrements.
+    Participant  : un nom ; appartient à une compétition.
+    Enregistrement (recording) : un GPX d'enregistrement ; appartient à une
+                   étape ET à un participant (un seul par couple étape/coureur).
+Chaque élément peut être listé, effacé ou renommé/remplacé (voir les
+sous-commandes list-*, delete-* et rename-*/update-stage). Tout est stocké dans
+une base SQLite, ce qui rend l'outil persistant entre deux exécutions.
 
-Toutes les données (compétitions, étapes, cols, participants, enregistrements)
-sont stockées dans une base SQLite, ce qui rend l'outil persistant entre deux
-exécutions.
+Les trois classements
+---------------------
+1. CLASSEMENT GÉNÉRAL — « maillot jaune » — par temps.
+   Pour chaque étape, on mesure le temps de parcours de chaque coureur (selon
+   CLASSEMENT_GENERAL_MODE : durée arrivée-départ de sa trace, ou heure absolue
+   d'arrivée). Le plus rapide est 1er à 0 s ; les autres reçoivent leur écart.
+   Au classement de la compétition, on additionne les temps de toutes les
+   étapes (temps cumulé) et on classe du plus rapide au plus lent.
 
-Sous-commandes principales
---------------------------
-    create-race        Créer une compétition
-    create-stage       Créer une étape à partir d'un GPX enrichi
-    add-participant    Inscrire un participant à une compétition
-    add-recording      Ajouter la trace GPX d'un participant sur une étape
-    list-participants  Lister les participants
-    list-races         Lister les compétitions
-    list-stages        Lister les étapes d'une compétition
-    rankings           (Ré)afficher les classements à la demande
+2. CLASSEMENT DE LA MONTAGNE — « maillot à pois » — par points.
+   Pour chaque col CLASSÉ du GPX de l'étape (catégorie HC/1/2/3/4), on mesure le
+   temps d'ascension de chaque coureur : durée entre son passage au pied du col
+   (repère « Meilleur Grimpeur ») et son passage au sommet. Les coureurs sont
+   classés sur ce temps (par défaut le plus rapide d'abord, cf.
+   MONTAGNE_ORDRE_TEMPS) et reçoivent les points du barème POINTS_MONTAGNE
+   propre à la catégorie du col. Le classement de l'étape, puis de la
+   compétition, est la somme de ces points.
+
+3. CLASSEMENT PAR POINTS DES SPRINTS — « maillot vert » — par points.
+   Pour chaque sprint intermédiaire du GPX de l'étape (waypoint symbole 19), on
+   relève l'heure de passage absolue de chaque coureur au point du sprint (les
+   coureurs sont supposés être partis en même temps). Les coureurs sont classés
+   du premier passé au dernier et reçoivent les points du barème POINTS_SPRINT.
+   En cas d'égalité de temps de passage, les coureurs concernés reçoivent tous
+   les mêmes points (il peut donc y avoir plusieurs 1ers, plusieurs 2es, etc. —
+   classement « dense »). Le classement de l'étape, puis de la compétition, est
+   la somme de ces points.
+
+Sous-commandes
+--------------
+    create-race / rename-race / delete-race        Gérer les compétitions
+    create-stage / update-stage / delete-stage     Gérer les étapes
+    add-participant / rename-participant /
+        delete-participant                         Gérer les participants
+    add-recording / delete-recording               Gérer les enregistrements
+    list-races / list-stages / list-participants /
+        list-recordings                            Lister les éléments
+    rankings                                       (Ré)afficher les classements
 
 Lancez « python competition.py <sous-commande> --help » pour l'aide détaillée.
 
@@ -64,6 +94,13 @@ POINTS_MONTAGNE = {
     "3":  [2, 1],                         # 3e catégorie   — 2 premiers
     "4":  [1],                            # 4e catégorie   — 1er coureur
 }
+
+# --- Barème du classement par points des sprints (maillot vert) -------------
+# Points attribués aux coureurs selon leur ordre de passage à un sprint
+# intermédiaire (1er, 2e, 3e...). La longueur de la liste fixe le nombre de
+# coureurs récompensés ; les suivants reçoivent 0 point. En cas d'égalité de
+# temps de passage, les coureurs concernés reçoivent tous les mêmes points.
+POINTS_SPRINT = [50, 30, 20, 18, 16]
 
 # --- Vérification du suivi de tracé ------------------------------------------
 # Largeur du « couloir » autour du tracé de référence, en mètres. Un point de la
@@ -252,6 +289,29 @@ def extract_classified_cols(xml_text):
     return cols
 
 
+def extract_sprints(xml_text):
+    """
+    Extrait les sprints intermédiaires des waypoints du GPX enrichi.
+
+    Un sprint est un waypoint portant le symbole 19. On en tire son nom et sa
+    position. Ces sprints servent de base au classement par points (maillot
+    vert).
+    """
+    root = ET.fromstring(xml_text)
+    sprints = []
+    for wpt in root.findall("gpx:wpt", NS):
+        sym = (wpt.findtext("gpx:sym", "", NS) or "").strip()
+        if sym != "19":
+            continue
+        name = (wpt.findtext("gpx:name", "", NS) or "").strip()
+        sprints.append({
+            "name": name or "Sprint",
+            "lat": float(wpt.get("lat")),
+            "lon": float(wpt.get("lon")),
+        })
+    return sprints
+
+
 def cumulative_km(track):
     """Distances cumulées (km) le long d'une trace."""
     dist = [0.0]
@@ -335,6 +395,16 @@ CREATE TABLE IF NOT EXISTS cols (
     summit_ele  REAL,
     foot_lat    REAL NOT NULL,
     foot_lon    REAL NOT NULL,
+    ordre       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sprints (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage_id    INTEGER NOT NULL REFERENCES stages(id),
+    name        TEXT NOT NULL,
+    lat         REAL NOT NULL,
+    lon         REAL NOT NULL,
+    km          REAL,
     ordre       INTEGER NOT NULL
 );
 
@@ -467,18 +537,25 @@ def elapsed_seconds(stage_track, rec_track):
 
 def col_ascent_seconds(rec_track, col):
     """
-    Temps d'ascension (secondes) d'un col par un participant : différence entre
-    l'horodatage au sommet et l'horodatage au pied, sur la trace du participant.
+    Temps d'ascension d'un col par un participant.
 
     Le pied est localisé en REMONTANT la trace du participant depuis le sommet
     sur la longueur de montée annoncée par le GPX enrichi. Cette mesure « par
     distance » est robuste aux parcours en boucle (contrairement à une simple
     recherche du point géographiquement le plus proche du pied, qui peut tomber
-    sur un autre passage du tracé). Renvoie None si l'ascension est non mesurable.
+    sur un autre passage du tracé).
+
+    Renvoie le couple (duree_s, longueur_km) :
+      - duree_s    : temps écoulé entre le pied et le sommet ;
+      - longueur_km: longueur réelle du segment d'ascension sur la trace du
+                     coureur. Normalement identique pour tous les coureurs ;
+                     cette valeur est affichée pour permettre aux arbitres de
+                     vérifier l'exactitude du segment pris en compte.
+    Renvoie (None, None) si l'ascension n'est pas mesurable.
     """
     si, _ = nearest_index(rec_track, col["summit_lat"], col["summit_lon"])
     if si == 0:
-        return None
+        return None, None
     climb_km = col.get("climb_km")
     if climb_km and climb_km > 0:
         target_m = climb_km * 1000.0
@@ -493,9 +570,26 @@ def col_ascent_seconds(rec_track, col):
     t_summit = rec_track[si].time
     t_foot = rec_track[fi].time
     if t_summit is None or t_foot is None:
-        return None
+        return None, None
     dt = (t_summit - t_foot).total_seconds()
-    return dt if dt > 0 else None
+    if dt <= 0:
+        return None, None
+    length_m = sum(haversine(rec_track[k].lat, rec_track[k].lon,
+                             rec_track[k + 1].lat, rec_track[k + 1].lon)
+                   for k in range(fi, si))
+    return dt, length_m / 1000.0
+
+
+def sprint_passage_time(rec_track, sprint):
+    """
+    Heure de passage absolue d'un coureur au point d'un sprint intermédiaire.
+
+    Renvoie le datetime du point de la trace le plus proche du sprint, ou None
+    si la trace n'est pas horodatée. Les coureurs étant supposés partis en même
+    temps, cette heure absolue suffit à les départager pour le maillot vert.
+    """
+    si, _ = nearest_index(rec_track, sprint["lat"], sprint["lon"])
+    return rec_track[si].time
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -510,15 +604,19 @@ def compute_stage_results(conn, stage):
       {
         "stage": <row stage>,
         "cols":  [<row col>, ...],
+        "sprints": [<row sprint>, ...],
         "participants": { participant_id: {
               "name": str, "verified": bool,
               "elapsed": float|None, "finish": datetime|None,
-              "col_times": { col_id: float|None } } }
+              "col_times":    { col_id: (duree_s|None, longueur_km|None) },
+              "sprint_times": { sprint_id: datetime|None } } }
       }
     """
     stage_track = parse_gpx_track(stage["gpx_xml"])
     cols = conn.execute("SELECT * FROM cols WHERE stage_id = ? ORDER BY ordre",
                         (stage["id"],)).fetchall()
+    sprints = conn.execute("SELECT * FROM sprints WHERE stage_id = ? ORDER BY ordre",
+                           (stage["id"],)).fetchall()
     recs = conn.execute(
         "SELECT r.*, p.name AS pname FROM recordings r "
         "JOIN participants p ON p.id = r.participant_id WHERE r.stage_id = ?",
@@ -531,32 +629,56 @@ def compute_stage_results(conn, stage):
         col_times = {}
         for col in cols:
             col_times[col["id"]] = col_ascent_seconds(rec_track, dict(col))
+        sprint_times = {}
+        for sp in sprints:
+            sprint_times[sp["id"]] = sprint_passage_time(rec_track, dict(sp))
         participants[r["participant_id"]] = {
             "name": r["pname"],
             "verified": bool(r["verified"]),
             "elapsed": elapsed,
             "finish": finish,
             "col_times": col_times,
+            "sprint_times": sprint_times,
         }
-    return {"stage": stage, "cols": cols, "participants": participants}
+    return {"stage": stage, "cols": cols, "sprints": sprints,
+            "participants": participants}
 
 
 def _rank_times(items, ascending=True):
     """
     Classe une liste de (clé, temps) par temps. Renvoie [(rang, clé, temps), ...].
-    Les éléments à temps None sont exclus.
+    Rangs séquentiels (1, 2, 3...). Les éléments à temps None sont exclus.
     """
     valid = [(k, t) for k, t in items if t is not None]
     valid.sort(key=lambda x: x[1], reverse=not ascending)
     return [(i + 1, k, t) for i, (k, t) in enumerate(valid)]
 
 
+def _dense_rank(items):
+    """
+    Classement DENSE d'une liste de (clé, valeur), par valeur croissante.
+    Les clés de valeur égale partagent le même rang : les rangs se suivent
+    1, 1, 2, 3, 3, 3, 4... — d'où la possibilité de plusieurs 1ers, plusieurs
+    2es, etc. Renvoie [(rang, clé, valeur), ...]. Valeurs None exclues.
+    """
+    valid = [(k, v) for k, v in items if v is not None]
+    valid.sort(key=lambda x: x[1])
+    out, rank, prev = [], 0, object()
+    for k, v in valid:
+        if v != prev:
+            rank += 1
+            prev = v
+        out.append((rank, k, v))
+    return out
+
+
 def mountain_points_for_stage(results):
     """
-    Calcule le classement de la montagne d'une étape.
+    Calcule le classement de la montagne d'une étape (maillot à pois).
 
     Renvoie :
-      per_col : { col_id: [(rang, participant_id, temps_s, points), ...] }
+      per_col : { col_id: [(rang, participant_id, temps_s, longueur_km,
+                            points), ...] }
       totals  : { participant_id: points_total }
     """
     ascending = (MONTAGNE_ORDRE_TEMPS == "croissant")
@@ -565,7 +687,7 @@ def mountain_points_for_stage(results):
     for col in results["cols"]:
         cid = col["id"]
         bareme = POINTS_MONTAGNE.get(col["category"], [])
-        items = [(pid, info["col_times"].get(cid))
+        items = [(pid, info["col_times"].get(cid, (None, None))[0])
                  for pid, info in results["participants"].items()
                  if info["verified"]]
         ranked = _rank_times(items, ascending=ascending)
@@ -573,9 +695,46 @@ def mountain_points_for_stage(results):
         for rang, pid, temps in ranked:
             pts = bareme[rang - 1] if rang - 1 < len(bareme) else 0
             totals[pid] = totals.get(pid, 0) + pts
-            rows.append((rang, pid, temps, pts))
+            longueur = results["participants"][pid]["col_times"].get(cid, (None, None))[1]
+            rows.append((rang, pid, temps, longueur, pts))
         per_col[cid] = rows
     return per_col, totals
+
+
+def sprint_points_for_stage(results):
+    """
+    Calcule le classement par points des sprints d'une étape (maillot vert).
+
+    Pour chaque sprint, les coureurs sont classés selon leur heure de passage
+    absolue (les plus rapides d'abord) en classement DENSE : les coureurs
+    passés à la même seconde partagent le rang et reçoivent les mêmes points
+    du barème POINTS_SPRINT.
+
+    Renvoie :
+      per_sprint : { sprint_id: [(rang, participant_id, passage_dt,
+                                  points), ...] }
+      totals     : { participant_id: points_total }
+    """
+    per_sprint = {}
+    totals = {pid: 0 for pid in results["participants"]}
+    for sp in results["sprints"]:
+        sid = sp["id"]
+        # Valeur de tri : heure de passage absolue arrondie à la seconde.
+        items = []
+        for pid, info in results["participants"].items():
+            if not info["verified"]:
+                continue
+            t = info["sprint_times"].get(sid)
+            items.append((pid, round(t.timestamp()) if t else None))
+        ranked = _dense_rank(items)
+        rows = []
+        for rang, pid, _v in ranked:
+            pts = POINTS_SPRINT[rang - 1] if rang - 1 < len(POINTS_SPRINT) else 0
+            totals[pid] = totals.get(pid, 0) + pts
+            passage = results["participants"][pid]["sprint_times"].get(sid)
+            rows.append((rang, pid, passage, pts))
+        per_sprint[sid] = rows
+    return per_sprint, totals
 
 
 def general_ranking_for_stage(results):
@@ -611,6 +770,7 @@ def compute_competition(conn, race):
     Renvoie un dict avec :
       "stages"            : [résultats par étape] (ordre des étapes)
       "mountain_total"    : [(rang, pid, name, points), ...]
+      "sprint_total"      : [(rang, pid, name, points), ...]
       "general_total"     : [(rang, pid, name, total_elapsed_s, ecart_s,
                               nb_etapes), ...]
     """
@@ -621,22 +781,28 @@ def compute_competition(conn, race):
 
     stage_blocks = []
     mountain_total = {pid: 0 for pid in all_names}
+    sprint_total = {pid: 0 for pid in all_names}
     general_time = {pid: 0.0 for pid in all_names}
     general_count = {pid: 0 for pid in all_names}
 
     for stage in stages:
         results = compute_stage_results(conn, stage)
         per_col, m_totals = mountain_points_for_stage(results)
+        per_sprint, s_totals = sprint_points_for_stage(results)
         g_rank = general_ranking_for_stage(results)
         for pid, pts in m_totals.items():
             mountain_total[pid] = mountain_total.get(pid, 0) + pts
+        for pid, pts in s_totals.items():
+            sprint_total[pid] = sprint_total.get(pid, 0) + pts
         for rang, pid, elapsed, ecart in g_rank:
             if elapsed is not None:
                 general_time[pid] += elapsed
                 general_count[pid] += 1
         stage_blocks.append({
             "stage": stage, "results": results,
-            "per_col": per_col, "mountain": m_totals, "general": g_rank,
+            "per_col": per_col, "mountain": m_totals,
+            "per_sprint": per_sprint, "sprint": s_totals,
+            "general": g_rank,
         })
 
     # Classement montagne global : tri par points décroissants.
@@ -644,6 +810,12 @@ def compute_competition(conn, race):
                      if pts > 0), key=lambda x: -x[2])
     mountain_final = [(i + 1, pid, name, pts)
                       for i, (pid, name, pts) in enumerate(m_list)]
+
+    # Classement par points (sprints) global : tri par points décroissants.
+    s_list = sorted(((pid, all_names[pid], pts) for pid, pts in sprint_total.items()
+                     if pts > 0), key=lambda x: -x[2])
+    sprint_final = [(i + 1, pid, name, pts)
+                    for i, (pid, name, pts) in enumerate(s_list)]
 
     # Classement général global : on classe d'abord les participants ayant
     # terminé le plus d'étapes, puis par temps cumulé croissant.
@@ -659,6 +831,7 @@ def compute_competition(conn, race):
         "race": race,
         "stages": stage_blocks,
         "mountain_total": mountain_final,
+        "sprint_total": sprint_final,
         "general_total": general_final,
     }
 
@@ -688,6 +861,13 @@ def fmt_ecart(seconds):
     if abs(seconds) < 0.5:
         return "—"
     return "+" + fmt_duration(abs(seconds))
+
+
+def fmt_clock(dt):
+    """Formate une heure de passage absolue en HH:MM:SS, « — » si inconnue."""
+    if dt is None:
+        return "—"
+    return dt.strftime("%H:%M:%S")
 
 
 def _table(rows, headers):
@@ -720,17 +900,21 @@ def print_competition(comp):
         if results["cols"]:
             print("│")
             print("│  CLASSEMENT DE LA MONTAGNE — détail par col")
+            print("│  (la longueur, normalement identique pour tous, permet")
+            print("│   aux arbitres de vérifier le segment d'ascension retenu)")
             for col in results["cols"]:
                 label = "HC" if col["category"] == "HC" else f"Cat. {col['category']}"
                 print(f"│")
                 print(f"│  ▸ {col['name']} ({label})")
                 rows = []
-                for rang, pid, temps, pts in block["per_col"][col["id"]]:
+                for rang, pid, temps, longueur, pts in block["per_col"][col["id"]]:
                     rows.append([rang, names.get(pid, f"#{pid}"),
-                                 fmt_duration(temps), pts])
+                                 fmt_duration(temps),
+                                 f"{longueur:.2f} km" if longueur is not None else "—",
+                                 pts])
                 if rows:
-                    print(_indent(_table(rows, ["Rang", "Coureur",
-                                                "Temps asc.", "Points"])))
+                    print(_indent(_table(rows, ["Rang", "Coureur", "Temps asc.",
+                                                "Longueur", "Points"])))
                 else:
                     print("    (aucun temps d'ascension exploitable)")
         else:
@@ -744,6 +928,36 @@ def print_competition(comp):
                 for i, (pid, pts) in enumerate(m_rows) if pts > 0]
         print(_indent(_table(rows, ["Rang", "Coureur", "Points"]))
               if rows else "    (aucun point attribué)")
+
+        # --- Classement par points (sprints), sprint par sprint -------------
+        if results["sprints"]:
+            print("│")
+            print("│  CLASSEMENT PAR POINTS (MAILLOT VERT) — détail par sprint")
+            for sp in results["sprints"]:
+                km = f" — km {sp['km']:.1f}" if sp["km"] is not None else ""
+                print("│")
+                print(f"│  ▸ {sp['name']}{km}")
+                rows = []
+                for rang, pid, passage, pts in block["per_sprint"][sp["id"]]:
+                    rows.append([rang, names.get(pid, f"#{pid}"),
+                                 fmt_clock(passage), pts])
+                if rows:
+                    print(_indent(_table(rows, ["Rang", "Coureur",
+                                                "Passage", "Points"])))
+                else:
+                    print("    (aucun passage exploitable)")
+
+            # --- Classement par points de l'étape ---------------------------
+            print("│")
+            print("│  CLASSEMENT PAR POINTS (MAILLOT VERT) — étape")
+            s_rows = sorted(block["sprint"].items(), key=lambda x: -x[1])
+            rows = [[i + 1, names.get(pid, f"#{pid}"), pts]
+                    for i, (pid, pts) in enumerate(s_rows) if pts > 0]
+            print(_indent(_table(rows, ["Rang", "Coureur", "Points"]))
+                  if rows else "    (aucun point attribué)")
+        else:
+            print("│")
+            print("│  (aucun sprint intermédiaire sur cette étape)")
 
         # --- Classement général de l'étape ----------------------------------
         print("│")
@@ -769,6 +983,13 @@ def print_competition(comp):
     print("  CLASSEMENT DE LA MONTAGNE — COMPÉTITION (cumul des étapes)")
     print("═" * 74)
     rows = [[r, name, pts] for r, pid, name, pts in comp["mountain_total"]]
+    print(_table(rows, ["Rang", "Coureur", "Points"])
+          if rows else "  (aucun point attribué)")
+
+    print("\n" + "═" * 74)
+    print("  CLASSEMENT PAR POINTS — MAILLOT VERT — COMPÉTITION (cumul des étapes)")
+    print("═" * 74)
+    rows = [[r, name, pts] for r, pid, name, pts in comp["sprint_total"]]
     print(_table(rows, ["Rang", "Coureur", "Points"])
           if rows else "  (aucun point attribué)")
 
@@ -846,10 +1067,17 @@ def export_pdf(comp, out_path):
         for col in results["cols"]:
             label = "HC" if col["category"] == "HC" else f"Cat. {col['category']}"
             story.append(Paragraph(f"Col : {col['name']} ({label})", h3))
-            rows = [[r, names.get(pid, f"#{pid}"), fmt_duration(t), pts]
-                    for r, pid, t, pts in block["per_col"][col["id"]]]
-            story.append(make_table(["Rang", "Coureur", "Temps asc.", "Points"],
-                                     rows, [1.6 * cm, 7 * cm, 3 * cm, 2 * cm]))
+            rows = [[r, names.get(pid, f"#{pid}"), fmt_duration(t),
+                     f"{lg:.2f} km" if lg is not None else "—", pts]
+                    for r, pid, t, lg, pts in block["per_col"][col["id"]]]
+            story.append(make_table(
+                ["Rang", "Coureur", "Temps asc.", "Longueur", "Points"],
+                rows, [1.4 * cm, 6 * cm, 2.6 * cm, 2.4 * cm, 1.6 * cm]))
+        if results["cols"]:
+            story.append(Paragraph(
+                "La longueur de l'ascension, normalement identique pour tous "
+                "les coureurs, permet aux arbitres de vérifier l'exactitude du "
+                "segment pris en compte.", small))
 
         story.append(Paragraph("Classement de la montagne — étape", h3))
         m_rows = sorted(block["mountain"].items(), key=lambda x: -x[1])
@@ -857,6 +1085,22 @@ def export_pdf(comp, out_path):
                 for i, (pid, pts) in enumerate(m_rows) if pts > 0]
         story.append(make_table(["Rang", "Coureur", "Points"], rows,
                                  [1.6 * cm, 9 * cm, 3 * cm]))
+
+        for sp in results["sprints"]:
+            km = f" — km {sp['km']:.1f}" if sp["km"] is not None else ""
+            story.append(Paragraph(f"Sprint : {sp['name']}{km}", h3))
+            rows = [[r, names.get(pid, f"#{pid}"), fmt_clock(passage), pts]
+                    for r, pid, passage, pts in block["per_sprint"][sp["id"]]]
+            story.append(make_table(["Rang", "Coureur", "Passage", "Points"],
+                                     rows, [1.6 * cm, 7 * cm, 3 * cm, 2 * cm]))
+        if results["sprints"]:
+            story.append(Paragraph(
+                "Classement par points (maillot vert) — étape", h3))
+            s_rows = sorted(block["sprint"].items(), key=lambda x: -x[1])
+            rows = [[i + 1, names.get(pid, f"#{pid}"), pts]
+                    for i, (pid, pts) in enumerate(s_rows) if pts > 0]
+            story.append(make_table(["Rang", "Coureur", "Points"], rows,
+                                     [1.6 * cm, 9 * cm, 3 * cm]))
 
         story.append(Paragraph("Classement général — étape", h3))
         rows = [[r, names.get(pid, f"#{pid}"), fmt_duration(e),
@@ -868,6 +1112,11 @@ def export_pdf(comp, out_path):
 
     story.append(Paragraph("Classement de la montagne — COMPÉTITION", h2))
     rows = [[r, name, pts] for r, pid, name, pts in comp["mountain_total"]]
+    story.append(make_table(["Rang", "Coureur", "Points"], rows,
+                             [1.6 * cm, 9 * cm, 3 * cm]))
+
+    story.append(Paragraph("Classement par points — Maillot vert — COMPÉTITION", h2))
+    rows = [[r, name, pts] for r, pid, name, pts in comp["sprint_total"]]
     story.append(make_table(["Rang", "Coureur", "Points"], rows,
                              [1.6 * cm, 9 * cm, 3 * cm]))
 
@@ -887,6 +1136,66 @@ def export_pdf(comp, out_path):
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  SOUS-COMMANDES CLI                                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+
+def _index_stage_features(conn, stage_id, track, xml_text):
+    """
+    Extrait les cols classés et les sprints du GPX d'une étape et les (ré)inscrit
+    en base. Utilisé à la création (create-stage) comme au remplacement du tracé
+    (update-stage). Les anciens cols/sprints de l'étape sont d'abord effacés.
+
+    Renvoie (cols, sprints_km) pour l'affichage : `cols` est la liste brute des
+    cols, `sprints_km` la liste [(km, sprint), ...] triée par kilométrage.
+    """
+    cols = extract_classified_cols(xml_text)
+    sprints = extract_sprints(xml_text)
+    cum = cumulative_km(track)
+
+    conn.execute("DELETE FROM cols WHERE stage_id = ?", (stage_id,))
+    conn.execute("DELETE FROM sprints WHERE stage_id = ?", (stage_id,))
+
+    # Cols : sommet sur le tracé + pied de la montée.
+    for i, col in enumerate(cols):
+        s_idx, _ = nearest_index(track, col["summit_lat"], col["summit_lon"])
+        f_idx = find_foot_index(track, s_idx, col["climb_km"])
+        conn.execute(
+            "INSERT INTO cols (stage_id, name, category, climb_km, summit_lat, "
+            "summit_lon, summit_ele, foot_lat, foot_lon, ordre) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (stage_id, col["name"], col["category"], col["climb_km"],
+             col["summit_lat"], col["summit_lon"], col["summit_ele"],
+             track[f_idx].lat, track[f_idx].lon, i))
+
+    # Sprints intermédiaires (waypoints symbole 19), triés par kilométrage.
+    sprints_km = []
+    for sp in sprints:
+        idx, _ = nearest_index(track, sp["lat"], sp["lon"])
+        sprints_km.append((cum[idx], sp))
+    sprints_km.sort(key=lambda x: x[0])
+    for i, (km, sp) in enumerate(sprints_km):
+        conn.execute(
+            "INSERT INTO sprints (stage_id, name, lat, lon, km, ordre) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (stage_id, sp["name"], sp["lat"], sp["lon"], km, i))
+    return cols, sprints_km
+
+
+def get_stage(conn, race, name):
+    """Retrouve une étape par son nom au sein d'une compétition."""
+    row = conn.execute("SELECT * FROM stages WHERE race_id = ? AND name = ?",
+                        (race["id"], name)).fetchone()
+    if not row:
+        raise SystemExit(f"Erreur : étape « {name} » introuvable dans "
+                         f"« {race['name']} ».")
+    return row
+
+
+def _require_yes(args, quoi):
+    """Garde-fou pour les suppressions : exige le drapeau --yes."""
+    if not getattr(args, "yes", False):
+        raise SystemExit(f"Suppression de {quoi} : opération destructive et "
+                         f"définitive.\nRelancez la commande avec --yes pour "
+                         f"confirmer.")
+
 
 def cmd_create_race(conn, args):
     """create-race : crée une nouvelle compétition."""
@@ -912,7 +1221,6 @@ def cmd_create_stage(conn, args):
     if len(track) < 2:
         raise SystemExit("Erreur : le GPX ne contient pas de tracé exploitable.")
     total_km = cumulative_km(track)[-1]
-    cols = extract_classified_cols(xml_text)
 
     ordre = (conn.execute("SELECT COALESCE(MAX(ordre), 0) + 1 FROM stages "
                           "WHERE race_id = ?", (race["id"],)).fetchone()[0])
@@ -926,17 +1234,7 @@ def cmd_create_stage(conn, args):
                          f"cette compétition.")
     stage_id = cur.lastrowid
 
-    # Cols : sommet sur le tracé + pied de la montée.
-    for i, col in enumerate(cols):
-        s_idx, _ = nearest_index(track, col["summit_lat"], col["summit_lon"])
-        f_idx = find_foot_index(track, s_idx, col["climb_km"])
-        conn.execute(
-            "INSERT INTO cols (stage_id, name, category, climb_km, summit_lat, "
-            "summit_lon, summit_ele, foot_lat, foot_lon, ordre) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (stage_id, col["name"], col["category"], col["climb_km"],
-             col["summit_lat"], col["summit_lon"], col["summit_ele"],
-             track[f_idx].lat, track[f_idx].lon, i))
+    cols, sprints_km = _index_stage_features(conn, stage_id, track, xml_text)
     conn.commit()
 
     print(f"✓ Étape créée : « {args.name} » (compétition « {race['name']} »)")
@@ -949,6 +1247,12 @@ def cmd_create_stage(conn, args):
             print(f"    • {col['name']:32s} {label:7s} montée {km}")
     else:
         print("  Aucun col classé dans ce GPX.")
+    if sprints_km:
+        print(f"  Sprints intermédiaires détectés ({len(sprints_km)}) :")
+        for km, sp in sprints_km:
+            print(f"    • {sp['name']:32s} km {km:.1f}")
+    else:
+        print("  Aucun sprint intermédiaire dans ce GPX.")
 
 
 def cmd_add_participant(conn, args):
@@ -1117,6 +1421,169 @@ def cmd_list_stages(conn, args):
     print()
 
 
+def cmd_list_recordings(conn, args):
+    """list-recordings : liste les enregistrements (traces) déposés."""
+    race = get_race(conn, args.race)
+    query = ("SELECT s.ordre AS ordre, s.name AS stage, p.name AS coureur, "
+             "r.verified, r.pct_inside, r.max_ecart_m "
+             "FROM recordings r "
+             "JOIN stages s ON s.id = r.stage_id "
+             "JOIN participants p ON p.id = r.participant_id "
+             "WHERE s.race_id = ?")
+    params = [race["id"]]
+    if args.stage:
+        query += " AND s.name = ?"
+        params.append(args.stage)
+    if args.participant:
+        query += " AND p.name = ?"
+        params.append(args.participant)
+    query += " ORDER BY s.ordre, p.name"
+    recs = conn.execute(query, params).fetchall()
+
+    print(f"\nEnregistrements de « {race['name']} » :")
+    if not recs:
+        print("  (aucun enregistrement)")
+        return
+    rows = []
+    for r in recs:
+        statut = "vérifié" if r["verified"] else "NON conforme"
+        pct = f"{r['pct_inside'] * 100:.0f} %" if r["pct_inside"] is not None else "—"
+        ecart = f"{r['max_ecart_m']:.0f} m" if r["max_ecart_m"] is not None else "—"
+        rows.append([r["ordre"], r["stage"], r["coureur"], statut, pct, ecart])
+    print(_table(rows, ["N° ét.", "Étape", "Coureur", "Statut",
+                        "Suivi", "Écart max"]))
+    print()
+
+
+def cmd_delete_race(conn, args):
+    """delete-race : efface une compétition et tout son contenu."""
+    race = get_race(conn, args.name)
+    _require_yes(args, f"la compétition « {race['name']} »")
+    sids = [s["id"] for s in conn.execute(
+        "SELECT id FROM stages WHERE race_id = ?", (race["id"],))]
+    for sid in sids:
+        conn.execute("DELETE FROM recordings WHERE stage_id = ?", (sid,))
+        conn.execute("DELETE FROM cols WHERE stage_id = ?", (sid,))
+        conn.execute("DELETE FROM sprints WHERE stage_id = ?", (sid,))
+    conn.execute("DELETE FROM stages WHERE race_id = ?", (race["id"],))
+    conn.execute("DELETE FROM participants WHERE race_id = ?", (race["id"],))
+    conn.execute("DELETE FROM races WHERE id = ?", (race["id"],))
+    conn.commit()
+    print(f"✓ Compétition « {race['name']} » supprimée "
+          f"({len(sids)} étape(s) et toutes les données associées).")
+
+
+def cmd_delete_stage(conn, args):
+    """delete-stage : efface une étape, ses cols, sprints et enregistrements."""
+    race = get_race(conn, args.race)
+    stage = get_stage(conn, race, args.name)
+    _require_yes(args, f"l'étape « {stage['name']} »")
+    conn.execute("DELETE FROM recordings WHERE stage_id = ?", (stage["id"],))
+    conn.execute("DELETE FROM cols WHERE stage_id = ?", (stage["id"],))
+    conn.execute("DELETE FROM sprints WHERE stage_id = ?", (stage["id"],))
+    conn.execute("DELETE FROM stages WHERE id = ?", (stage["id"],))
+    conn.commit()
+    print(f"✓ Étape « {stage['name']} » supprimée "
+          f"(compétition « {race['name']} »).")
+
+
+def cmd_delete_participant(conn, args):
+    """delete-participant : efface un participant et ses enregistrements."""
+    participant = _resolve_participant(conn, args.name, args.race)
+    _require_yes(args, f"le participant « {participant['name']} »")
+    conn.execute("DELETE FROM recordings WHERE participant_id = ?",
+                 (participant["id"],))
+    conn.execute("DELETE FROM participants WHERE id = ?", (participant["id"],))
+    conn.commit()
+    print(f"✓ Participant « {participant['name']} » supprimé "
+          f"(ses enregistrements aussi).")
+
+
+def cmd_delete_recording(conn, args):
+    """delete-recording : efface la trace d'un participant sur une étape."""
+    race = get_race(conn, args.race)
+    stage = get_stage(conn, race, args.stage)
+    participant = _resolve_participant(conn, args.participant, race["name"])
+    cur = conn.execute("DELETE FROM recordings WHERE stage_id = ? AND "
+                       "participant_id = ?", (stage["id"], participant["id"]))
+    conn.commit()
+    if cur.rowcount == 0:
+        raise SystemExit(f"Erreur : aucun enregistrement de "
+                         f"« {participant['name']} » sur « {stage['name']} ».")
+    print(f"✓ Enregistrement de « {participant['name']} » sur "
+          f"« {stage['name']} » supprimé.")
+
+
+def cmd_rename_race(conn, args):
+    """rename-race : renomme une compétition."""
+    race = get_race(conn, args.name)
+    try:
+        conn.execute("UPDATE races SET name = ? WHERE id = ?",
+                     (args.new_name, race["id"]))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise SystemExit(f"Erreur : une compétition « {args.new_name} » "
+                         f"existe déjà.")
+    print(f"✓ Compétition renommée : « {race['name']} » → « {args.new_name} »")
+
+
+def cmd_rename_stage(conn, args):
+    """rename-stage : renomme une étape."""
+    race = get_race(conn, args.race)
+    stage = get_stage(conn, race, args.name)
+    try:
+        conn.execute("UPDATE stages SET name = ? WHERE id = ?",
+                     (args.new_name, stage["id"]))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise SystemExit(f"Erreur : une étape « {args.new_name} » existe déjà "
+                         f"dans « {race['name']} ».")
+    print(f"✓ Étape renommée : « {stage['name']} » → « {args.new_name} »")
+
+
+def cmd_rename_participant(conn, args):
+    """rename-participant : renomme un participant."""
+    participant = _resolve_participant(conn, args.name, args.race)
+    try:
+        conn.execute("UPDATE participants SET name = ? WHERE id = ?",
+                     (args.new_name, participant["id"]))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise SystemExit(f"Erreur : « {args.new_name} » est déjà inscrit à "
+                         f"cette compétition.")
+    print(f"✓ Participant renommé : « {participant['name']} » → "
+          f"« {args.new_name} »")
+
+
+def cmd_update_stage(conn, args):
+    """update-stage : remplace le GPX de tracé d'une étape existante."""
+    race = get_race(conn, args.race)
+    stage = get_stage(conn, race, args.name)
+    if not os.path.isfile(args.gpx):
+        raise SystemExit(f"Erreur : fichier GPX introuvable : {args.gpx}")
+    with open(args.gpx, "r", encoding="utf-8") as f:
+        xml_text = f.read()
+    track = parse_gpx_track(xml_text)
+    if len(track) < 2:
+        raise SystemExit("Erreur : le GPX ne contient pas de tracé exploitable.")
+    total_km = cumulative_km(track)[-1]
+
+    conn.execute("UPDATE stages SET gpx_xml = ?, total_km = ? WHERE id = ?",
+                 (xml_text, total_km, stage["id"]))
+    cols, sprints_km = _index_stage_features(conn, stage["id"], track, xml_text)
+    conn.commit()
+
+    nb_rec = conn.execute("SELECT COUNT(*) FROM recordings WHERE stage_id = ?",
+                          (stage["id"],)).fetchone()[0]
+    print(f"✓ Étape « {stage['name']} » mise à jour : {total_km:.1f} km, "
+          f"{len(cols)} col(s) classé(s), {len(sprints_km)} sprint(s).")
+    if nb_rec:
+        print(f"  ⚠  {nb_rec} enregistrement(s) déjà déposé(s) : leur "
+              f"conformité avait été évaluée sur l'ancien tracé.")
+        print(f"     En cas de changement réel d'itinéraire, redéposez-les "
+              f"(delete-recording puis add-recording).")
+
+
 def cmd_rankings(conn, args):
     """rankings : (ré)affiche les classements d'une compétition à la demande."""
     race = get_race(conn, args.race)
@@ -1164,8 +1631,13 @@ def build_parser():
             "--race \"Vosges 2026\"\n"
             "  python competition.py add-recording --participant Simon \\\n"
             "                        --gpx simon_kruth.gpx --pdf\n"
-            "  python competition.py list-participants\n"
+            "  python competition.py list-recordings --race \"Vosges 2026\"\n"
             "  python competition.py rankings --race \"Vosges 2026\" --pdf\n"
+            "  python competition.py rename-stage --name \"Lac de Kruth\" \\\n"
+            "                        --new-name \"Étape 1 - Kruth\"\n"
+            "  python competition.py update-stage --name \"Étape 1 - Kruth\" \\\n"
+            "                        --gpx kruth_v2_enrichi.gpx\n"
+            "  python competition.py delete-stage --name \"Étape 1 - Kruth\" --yes\n"
         ),
     )
     parser.add_argument("--db", default=DB_PATH_DEFAUT,
@@ -1180,9 +1652,41 @@ def build_parser():
     p.add_argument("--gpx", required=True, help="Fichier GPX enrichi de l'étape.")
     p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
 
+    p = sub.add_parser("update-stage",
+                       help="Remplacer le GPX de tracé d'une étape.")
+    p.add_argument("--name", required=True, help="Nom de l'étape à mettre à jour.")
+    p.add_argument("--gpx", required=True, help="Nouveau fichier GPX enrichi.")
+    p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
+
+    p = sub.add_parser("rename-stage", help="Renommer une étape.")
+    p.add_argument("--name", required=True, help="Nom actuel de l'étape.")
+    p.add_argument("--new-name", required=True, dest="new_name",
+                   help="Nouveau nom de l'étape.")
+    p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
+
+    p = sub.add_parser("delete-stage",
+                       help="Effacer une étape et ses enregistrements.")
+    p.add_argument("--name", required=True, help="Nom de l'étape.")
+    p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
+    p.add_argument("--yes", action="store_true",
+                   help="Confirmer la suppression définitive.")
+
     p = sub.add_parser("add-participant", help="Inscrire un participant.")
     p.add_argument("--name", required=True, help="Nom du participant.")
     p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
+
+    p = sub.add_parser("rename-participant", help="Renommer un participant.")
+    p.add_argument("--name", required=True, help="Nom actuel du participant.")
+    p.add_argument("--new-name", required=True, dest="new_name",
+                   help="Nouveau nom du participant.")
+    p.add_argument("--race", help="Compétition (lève une ambiguïté de nom).")
+
+    p = sub.add_parser("delete-participant",
+                       help="Effacer un participant et ses enregistrements.")
+    p.add_argument("--name", required=True, help="Nom du participant.")
+    p.add_argument("--race", help="Compétition (lève une ambiguïté de nom).")
+    p.add_argument("--yes", action="store_true",
+                   help="Confirmer la suppression définitive.")
 
     p = sub.add_parser("add-recording",
                        help="Ajouter la trace GPX d'un participant.")
@@ -1196,6 +1700,12 @@ def build_parser():
     p.add_argument("--pdf", action="store_true",
                    help="Exporter aussi les classements en PDF.")
 
+    p = sub.add_parser("delete-recording",
+                       help="Effacer la trace d'un coureur sur une étape.")
+    p.add_argument("--participant", required=True, help="Nom du participant.")
+    p.add_argument("--stage", required=True, help="Nom de l'étape.")
+    p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
+
     p = sub.add_parser("list-participants", help="Lister les participants.")
     p.add_argument("--race", help="Restreindre à une compétition.")
 
@@ -1203,6 +1713,23 @@ def build_parser():
 
     p = sub.add_parser("list-stages", help="Lister les étapes d'une compétition.")
     p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
+
+    p = sub.add_parser("list-recordings",
+                       help="Lister les enregistrements déposés.")
+    p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
+    p.add_argument("--stage", help="Restreindre à une étape.")
+    p.add_argument("--participant", help="Restreindre à un participant.")
+
+    p = sub.add_parser("rename-race", help="Renommer une compétition.")
+    p.add_argument("--name", required=True, help="Nom actuel de la compétition.")
+    p.add_argument("--new-name", required=True, dest="new_name",
+                   help="Nouveau nom de la compétition.")
+
+    p = sub.add_parser("delete-race",
+                       help="Effacer une compétition et tout son contenu.")
+    p.add_argument("--name", required=True, help="Nom de la compétition.")
+    p.add_argument("--yes", action="store_true",
+                   help="Confirmer la suppression définitive.")
 
     p = sub.add_parser("rankings", help="Afficher les classements.")
     p.add_argument("--race", help="Compétition cible (facultatif si une seule).")
@@ -1213,12 +1740,21 @@ def build_parser():
 
 COMMANDS = {
     "create-race": cmd_create_race,
+    "rename-race": cmd_rename_race,
+    "delete-race": cmd_delete_race,
     "create-stage": cmd_create_stage,
+    "update-stage": cmd_update_stage,
+    "rename-stage": cmd_rename_stage,
+    "delete-stage": cmd_delete_stage,
     "add-participant": cmd_add_participant,
+    "rename-participant": cmd_rename_participant,
+    "delete-participant": cmd_delete_participant,
     "add-recording": cmd_add_recording,
-    "list-participants": cmd_list_participants,
+    "delete-recording": cmd_delete_recording,
     "list-races": cmd_list_races,
     "list-stages": cmd_list_stages,
+    "list-participants": cmd_list_participants,
+    "list-recordings": cmd_list_recordings,
     "rankings": cmd_rankings,
 }
 
