@@ -102,6 +102,15 @@ POINTS_MONTAGNE = {
 # temps de passage, les coureurs concernés reçoivent tous les mêmes points.
 POINTS_SPRINT = [50, 30, 20, 18, 16]
 
+# --- Barème du maillot fourbe ------------------------------------------------
+# Le « maillot fourbe » récompense le coureur le plus véloce sur le DERNIER
+# kilomètre de chaque ascension classée. Le classement est RELATIF : chaque
+# coureur est chronométré sur son propre dernier km (temps au sommet moins le
+# temps 1 km avant le sommet), indépendamment de l'heure de départ.
+# Longueur de la fenêtre de mesure en km (modifiable).
+FOURBE_LAST_KM   = 1.0   # longueur (km) du segment mesuré avant le sommet
+POINTS_FOURBE    = [10, 7, 5, 3, 1]   # 1er : 10 pts, 2e : 7 pts, …
+
 # --- Vérification du suivi de tracé ------------------------------------------
 # Largeur du « couloir » autour du tracé de référence, en mètres. Un point de la
 # trace du participant est considéré « sur le tracé » s'il est à moins de cette
@@ -592,6 +601,48 @@ def sprint_passage_time(rec_track, sprint):
     return rec_track[si].time
 
 
+def last_km_fourbe_seconds(rec_track, col, last_km=None):
+    """
+    Temps (secondes) pour parcourir le dernier kilomètre d'une ascension.
+
+    Mesure RELATIVE : on remonte la trace du participant depuis le sommet sur
+    `last_km` kilomètres (FOURBE_LAST_KM par défaut), puis on calcule
+    (temps au sommet) - (temps au point -1 km).
+
+    Ce classement est relatif : les coureurs ne sont pas nécessairement partis
+    ensemble. Seule la vélocité sur le segment terminal est prise en compte.
+
+    Renvoie (duree_s, longueur_km_reelle) ou (None, None) si non mesurable.
+    """
+    if last_km is None:
+        last_km = FOURBE_LAST_KM
+
+    si, _ = nearest_index(rec_track, col["summit_lat"], col["summit_lon"])
+    if si == 0:
+        return None, None
+
+    target_m = last_km * 1000.0
+    acc, fi = 0.0, si
+    while fi > 0 and acc < target_m:
+        acc += haversine(rec_track[fi].lat, rec_track[fi].lon,
+                         rec_track[fi - 1].lat, rec_track[fi - 1].lon)
+        fi -= 1
+
+    if acc < target_m * 0.5:   # pas assez de trace avant le sommet
+        return None, None
+
+    t_summit = rec_track[si].time
+    t_start  = rec_track[fi].time
+    if t_summit is None or t_start is None:
+        return None, None
+
+    dt = (t_summit - t_start).total_seconds()
+    if dt <= 0:
+        return None, None
+
+    return dt, acc / 1000.0
+
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  CALCUL DES CLASSEMENTS                                                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -632,6 +683,9 @@ def compute_stage_results(conn, stage):
         sprint_times = {}
         for sp in sprints:
             sprint_times[sp["id"]] = sprint_passage_time(rec_track, dict(sp))
+        fourbe_times = {}
+        for col in cols:
+            fourbe_times[col["id"]] = last_km_fourbe_seconds(rec_track, dict(col))
         participants[r["participant_id"]] = {
             "name": r["pname"],
             "verified": bool(r["verified"]),
@@ -639,6 +693,7 @@ def compute_stage_results(conn, stage):
             "finish": finish,
             "col_times": col_times,
             "sprint_times": sprint_times,
+            "fourbe_times": fourbe_times,
         }
     return {"stage": stage, "cols": cols, "sprints": sprints,
             "participants": participants}
@@ -737,6 +792,40 @@ def sprint_points_for_stage(results):
     return per_sprint, totals
 
 
+def fourbe_points_for_stage(results):
+    """
+    Calcule le classement du maillot fourbe d'une étape.
+
+    Pour chaque col classé, on mesure le temps de chaque coureur sur le dernier
+    kilomètre de l'ascension (temps au sommet - temps 1 km avant). Le plus
+    rapide est 1er et reçoit le maximum de points du barème POINTS_FOURBE.
+
+    Ce classement est RELATIF : les coureurs ne sont pas nécessairement partis
+    ensemble, seule la vélocité terminale compte.
+
+    Renvoie :
+      per_col : { col_id: [(rang, participant_id, duree_s, longueur_km,
+                            points), ...] }
+      totals  : { participant_id: points_total }
+    """
+    per_col = {}
+    totals = {pid: 0 for pid in results["participants"]}
+    for col in results["cols"]:
+        cid = col["id"]
+        items = [(pid, info["fourbe_times"].get(cid, (None, None))[0])
+                 for pid, info in results["participants"].items()
+                 if info["verified"]]
+        ranked = _rank_times(items, ascending=True)   # le plus rapide est 1er
+        rows = []
+        for rang, pid, temps in ranked:
+            pts = POINTS_FOURBE[rang - 1] if rang - 1 < len(POINTS_FOURBE) else 0
+            totals[pid] = totals.get(pid, 0) + pts
+            longueur = results["participants"][pid]["fourbe_times"].get(cid, (None, None))[1]
+            rows.append((rang, pid, temps, longueur, pts))
+        per_col[cid] = rows
+    return per_col, totals
+
+
 def general_ranking_for_stage(results):
     """
     Classement général d'une étape : [(rang, participant_id, elapsed_s, ecart_s)].
@@ -782,6 +871,7 @@ def compute_competition(conn, race):
     stage_blocks = []
     mountain_total = {pid: 0 for pid in all_names}
     sprint_total = {pid: 0 for pid in all_names}
+    fourbe_total = {pid: 0 for pid in all_names}
     general_time = {pid: 0.0 for pid in all_names}
     general_count = {pid: 0 for pid in all_names}
 
@@ -789,11 +879,14 @@ def compute_competition(conn, race):
         results = compute_stage_results(conn, stage)
         per_col, m_totals = mountain_points_for_stage(results)
         per_sprint, s_totals = sprint_points_for_stage(results)
+        per_fourbe, f_totals = fourbe_points_for_stage(results)
         g_rank = general_ranking_for_stage(results)
         for pid, pts in m_totals.items():
             mountain_total[pid] = mountain_total.get(pid, 0) + pts
         for pid, pts in s_totals.items():
             sprint_total[pid] = sprint_total.get(pid, 0) + pts
+        for pid, pts in f_totals.items():
+            fourbe_total[pid] = fourbe_total.get(pid, 0) + pts
         for rang, pid, elapsed, ecart in g_rank:
             if elapsed is not None:
                 general_time[pid] += elapsed
@@ -802,6 +895,7 @@ def compute_competition(conn, race):
             "stage": stage, "results": results,
             "per_col": per_col, "mountain": m_totals,
             "per_sprint": per_sprint, "sprint": s_totals,
+            "per_fourbe": per_fourbe, "fourbe": f_totals,
             "general": g_rank,
         })
 
@@ -827,11 +921,18 @@ def compute_competition(conn, race):
     for i, (pid, name, total, count) in enumerate(g_list):
         general_final.append((i + 1, pid, name, total, total - base, count))
 
+    # Classement du maillot fourbe global : tri par points décroissants.
+    f_list = sorted(((pid, all_names[pid], pts) for pid, pts in fourbe_total.items()
+                     if pts > 0), key=lambda x: -x[2])
+    fourbe_final = [(i + 1, pid, name, pts)
+                    for i, (pid, name, pts) in enumerate(f_list)]
+
     return {
         "race": race,
         "stages": stage_blocks,
         "mountain_total": mountain_final,
         "sprint_total": sprint_final,
+        "fourbe_total": fourbe_final,
         "general_total": general_final,
     }
 
@@ -929,6 +1030,36 @@ def print_competition(comp):
         print(_indent(_table(rows, ["Rang", "Coureur", "Points"]))
               if rows else "    (aucun point attribué)")
 
+        # --- Maillot fourbe, col par col ------------------------------------
+        if results["cols"] and any(block["per_fourbe"].get(cid) for cid in block["per_fourbe"]):
+            print("│")
+            print("│  CLASSEMENT MAILLOT FOURBE — détail par col")
+            print(f"│  (temps sur le dernier {FOURBE_LAST_KM:.1f} km de chaque ascension,")
+            print("│   classement relatif : chaque coureur chronométré indépendamment)")
+            for col in results["cols"]:
+                label = "HC" if col["category"] == "HC" else f"Cat. {col['category']}"
+                print("│")
+                print(f"│  ▸ {col['name']} ({label})")
+                rows = []
+                for rang, pid, temps, longueur, pts in block["per_fourbe"][col["id"]]:
+                    rows.append([rang, names.get(pid, f"#{pid}"),
+                                 fmt_duration(temps),
+                                 f"{longueur:.2f} km" if longueur is not None else "—",
+                                 pts])
+                if rows:
+                    print(_indent(_table(rows, ["Rang", "Coureur", "Dernier km",
+                                                "Seg. réel", "Points"])))
+                else:
+                    print("    (aucun temps exploitable)")
+
+            print("│")
+            print("│  CLASSEMENT MAILLOT FOURBE — étape")
+            f_rows = sorted(block["fourbe"].items(), key=lambda x: -x[1])
+            rows = [[i + 1, names.get(pid, f"#{pid}"), pts]
+                    for i, (pid, pts) in enumerate(f_rows) if pts > 0]
+            print(_indent(_table(rows, ["Rang", "Coureur", "Points"]))
+                  if rows else "    (aucun point attribué)")
+
         # --- Classement par points (sprints), sprint par sprint -------------
         if results["sprints"]:
             print("│")
@@ -983,6 +1114,14 @@ def print_competition(comp):
     print("  CLASSEMENT DE LA MONTAGNE — COMPÉTITION (cumul des étapes)")
     print("═" * 74)
     rows = [[r, name, pts] for r, pid, name, pts in comp["mountain_total"]]
+    print(_table(rows, ["Rang", "Coureur", "Points"])
+          if rows else "  (aucun point attribué)")
+
+    print("\n" + "═" * 74)
+    print("  CLASSEMENT MAILLOT FOURBE — COMPÉTITION (cumul des étapes)")
+    print(f"  (temps sur le dernier {FOURBE_LAST_KM:.1f} km de chaque ascension classée)")
+    print("═" * 74)
+    rows = [[r, name, pts] for r, pid, name, pts in comp["fourbe_total"]]
     print(_table(rows, ["Rang", "Coureur", "Points"])
           if rows else "  (aucun point attribué)")
 
@@ -1086,6 +1225,26 @@ def export_pdf(comp, out_path):
         story.append(make_table(["Rang", "Coureur", "Points"], rows,
                                  [1.6 * cm, 9 * cm, 3 * cm]))
 
+        # Maillot fourbe par col
+        if results["cols"] and any(block["per_fourbe"].get(col["id"]) for col in results["cols"]):
+            story.append(Paragraph(
+                f"Maillot fourbe — dernier {FOURBE_LAST_KM:.1f} km par ascension", h3))
+            for col in results["cols"]:
+                label = "HC" if col["category"] == "HC" else f"Cat. {col['category']}"
+                story.append(Paragraph(f"  ▸ {col['name']} ({label})", h3))
+                rows = [[r, names.get(pid, f"#{pid}"), fmt_duration(t),
+                         f"{lg:.2f} km" if lg is not None else "—", pts]
+                        for r, pid, t, lg, pts in block["per_fourbe"][col["id"]]]
+                story.append(make_table(
+                    ["Rang", "Coureur", "Dernier km", "Seg. réel", "Points"],
+                    rows, [1.4 * cm, 5.5 * cm, 2.8 * cm, 2.4 * cm, 1.6 * cm]))
+            story.append(Paragraph("Maillot fourbe — étape", h3))
+            f_rows = sorted(block["fourbe"].items(), key=lambda x: -x[1])
+            rows = [[i + 1, names.get(pid, f"#{pid}"), pts]
+                    for i, (pid, pts) in enumerate(f_rows) if pts > 0]
+            story.append(make_table(["Rang", "Coureur", "Points"], rows,
+                                     [1.6 * cm, 9 * cm, 3 * cm]))
+
         for sp in results["sprints"]:
             km = f" — km {sp['km']:.1f}" if sp["km"] is not None else ""
             story.append(Paragraph(f"Sprint : {sp['name']}{km}", h3))
@@ -1112,6 +1271,12 @@ def export_pdf(comp, out_path):
 
     story.append(Paragraph("Classement de la montagne — COMPÉTITION", h2))
     rows = [[r, name, pts] for r, pid, name, pts in comp["mountain_total"]]
+    story.append(make_table(["Rang", "Coureur", "Points"], rows,
+                             [1.6 * cm, 9 * cm, 3 * cm]))
+
+    story.append(Paragraph(
+        f"Maillot fourbe — COMPÉTITION (dernier {FOURBE_LAST_KM:.1f} km de chaque ascension)", h2))
+    rows = [[r, name, pts] for r, pid, name, pts in comp["fourbe_total"]]
     story.append(make_table(["Rang", "Coureur", "Points"], rows,
                              [1.6 * cm, 9 * cm, 3 * cm]))
 

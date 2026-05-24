@@ -379,6 +379,8 @@ def parse_gpx(filepath):
 # ─── Requête Overpass ────────────────────────────────────────────────────────
 
 def build_query(bbox, incl_water, incl_food, incl_shop, incl_col):
+    if not any([incl_water, incl_food, incl_shop, incl_col]):
+        return None
     s, w, n, e = bbox
     buf = 0.005
     b = f"{s-buf:.4f},{w-buf:.4f},{n+buf:.4f},{e+buf:.4f}"
@@ -410,10 +412,13 @@ def build_query(bbox, incl_water, incl_food, incl_shop, incl_col):
             f'node["natural"="saddle"]({b});',
             f'node["natural"="peak"]["ele"]({b});',
         ]
-        return f"[out:json][timeout:30];\n(\n{''.join(parts)}\n);\nout body;"
+    return f"[out:json][timeout:30];\n(\n{''.join(parts)}\n);\nout body;"
 
-def query_overpass(bbox):
-    query = build_query(bbox, CATEGORIES["water"], CATEGORIES["food"], CATEGORIES["shop"], CATEGORIES["col"])
+def query_overpass(bbox, do_water=True, do_food=True, do_shop=True, do_cols=True):
+    query = build_query(bbox, do_water, do_food, do_shop, do_cols)
+    if query is None:
+        print("  Aucune catégorie Overpass sélectionnée, requête ignorée.")
+        return {'elements': []}
     print(f"  Requête Overpass...", end=" ", flush=True)
     headers = {
         "User-Agent": "GPX-POI-Enricher/1.0 (personal use)",
@@ -574,6 +579,78 @@ def inject_waypoints(root, pois):
 
         sym_el = ET.SubElement(wpt, f'{{{ns}}}sym')
         sym_el.text = get_symbol(poi['tags'], poi['cat'], poi.get('col_cat'))
+
+# ─── Gestion du ré-enrichissement ────────────────────────────────────────────
+
+# Symboles OpenRunner par catégorie (identifient les waypoints dans le GPX)
+_SYMS_WATER    = {'104'}
+_SYMS_FOOD     = {'49', '50'}   # 49=restaurant, 50=épicerie
+_SYMS_COLS     = {'62', '63', '64', '65', '66', '105', '17'}  # cols + pied d'ascension
+
+def remove_existing_waypoints(root, do_water=False, do_food=False, do_cols=False):
+    """
+    Supprime du GPX les waypoints des catégories à ré-enrichir.
+    Retourne le nombre de waypoints supprimés.
+
+    La suppression ne porte que sur les catégories demandées ; les sprints
+    (symbole 19) sont toujours préservés.
+    """
+    ns_str = 'http://www.topografix.com/GPX/1/1'
+    ns = {'gpx': ns_str}
+
+    to_remove_syms = set()
+    if do_water:
+        to_remove_syms |= _SYMS_WATER
+    if do_food:
+        to_remove_syms |= _SYMS_FOOD
+    if do_cols:
+        to_remove_syms |= _SYMS_COLS
+
+    if not to_remove_syms:
+        return 0
+
+    removed = 0
+    for wpt in list(root.findall('gpx:wpt', ns)):
+        sym = (wpt.findtext('gpx:sym', '', ns) or '').strip()
+        if sym in to_remove_syms:
+            root.remove(wpt)
+            removed += 1
+    return removed
+
+
+def update_gpx_metadata(root, actions_done):
+    """
+    Ajoute ou met à jour les métadonnées GPX pour tracer les enrichissements.
+
+    `actions_done` est un dict, par exemple :
+        {'cols': True, 'water': False, 'food': True, 'roadbook': False}
+
+    Un élément <enrichissement> est ajouté dans <metadata><extensions> avec
+    la date et les catégories traitées. Les enregistrements précédents sont
+    conservés (historique).
+    """
+    from datetime import datetime as _dt
+    ns_str = 'http://www.topografix.com/GPX/1/1'
+    ns = {'gpx': ns_str}
+    ET.register_namespace('', ns_str)
+
+    # Trouver ou créer <metadata>
+    meta = root.find('gpx:metadata', ns)
+    if meta is None:
+        meta = ET.Element(f'{{{ns_str}}}metadata')
+        root.insert(0, meta)
+
+    # Trouver ou créer <extensions> dans <metadata>
+    ext = meta.find('gpx:extensions', ns)
+    if ext is None:
+        ext = ET.SubElement(meta, f'{{{ns_str}}}extensions')
+
+    # Ajouter un élément d'historique
+    enr = ET.SubElement(ext, 'enrichissement')
+    enr.set('date', _dt.now().isoformat(timespec='seconds'))
+    for key, val in actions_done.items():
+        enr.set(key, 'oui' if val else 'non')
+
 
 # ─── Génération PDF roadbook ─────────────────────────────────────────────────
 
@@ -1522,15 +1599,40 @@ def generate_roadbook_print_sheet(single_pdf_path, out_path):
 
 # ─── Traitement principal ────────────────────────────────────────────────────
 
-def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
+def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None,
+                do_cols=True, do_water=False, do_food=False, do_roadbook=False):
     print(f"\n{'='*60}")
     print(f"Fichier: {filepath}")
 
-    track_pts, track_pts_ele, tree, root, existing_names = parse_gpx(filepath)
+    # ─── Ré-enrichissement : charger le fichier enrichi existant ─────────────
+    # Si un fichier _enrichi.gpx existe déjà, on le prend comme base et on
+    # efface uniquement les waypoints des catégories à re-traiter.
+    out_path = filepath.replace('.gpx', '_enrichi.gpx')
+    source_path = out_path if os.path.isfile(out_path) else filepath
+    if source_path == out_path:
+        print(f"  Fichier enrichi existant détecté → ré-enrichissement")
+
+    track_pts, track_pts_ele, tree, root, existing_names = parse_gpx(source_path)
     manual_names = load_manual_names()
     if not track_pts:
         print("  Aucun point trouvé, fichier ignoré.")
         return
+
+    # ─── Suppression des anciens waypoints des catégories ré-enrichies ───────
+    nb_removed = remove_existing_waypoints(root,
+                                           do_water=do_water,
+                                           do_food=do_food,
+                                           do_cols=do_cols)
+    if nb_removed:
+        print(f"  {nb_removed} waypoint(s) existant(s) supprimé(s) avant ré-enrichissement")
+
+    # ─── Résumé des enrichissements actifs ───────────────────────────────────
+    active = []
+    if do_cols:    active.append('cols')
+    if do_water:   active.append('eau')
+    if do_food:    active.append('alimentation')
+    if do_roadbook: active.append('roadbook')
+    print(f"  Enrichissements actifs : {', '.join(active) if active else '(aucun)'}")
     # Sprints déjà présents dans le GPX source (symbole 19) : retirés ici,
     # ils seront réinjectés au format homogène avec ceux du CSV.
     gpx_sprints = extract_gpx_sprints(root)
@@ -1540,15 +1642,28 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
     bbox = (min(lats), min(lons), max(lats), max(lons))
     print(f"  {len(track_pts)} points | bbox {tuple(f'{x:.3f}' for x in bbox)}")
 
-    try:
-        data = query_overpass(bbox)
-    except Exception as e:
-        print(f"  Erreur Overpass: {e}")
-        return
+    data = {'elements': []}
+    if do_water or do_food or do_cols:
+        try:
+            data = query_overpass(bbox,
+                                  do_water=do_water,
+                                  do_food=do_food,
+                                  do_shop=do_food,   # food flag couvre épiceries aussi
+                                  do_cols=do_cols)
+        except Exception as e:
+            print(f"  Erreur Overpass: {e}")
+            return
 
     max_dists = {'water': MAX_DIST_WATER, 'food': MAX_DIST_FOOD, 'shop': MAX_DIST_SHOP, 'col': MAX_DIST_COL}
+
+    # Catégories acceptées selon les flags actifs
+    accepted_cats = set()
+    if do_water: accepted_cats.add('water')
+    if do_food:  accepted_cats.update({'food', 'shop'})
+    if do_cols:  accepted_cats.add('col')
+
     pois = []
-    skipped = {'private': 0, 'far': 0, 'uncategorized': 0}
+    skipped = {'private': 0, 'far': 0, 'uncategorized': 0, 'inactive': 0}
 
     for el in data.get('elements', []):
         lat, lon = el.get('lat'), el.get('lon')
@@ -1561,6 +1676,9 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
         cat = categorize(el)
         if cat is None:
             skipped['uncategorized'] += 1
+            continue
+        if cat not in accepted_cats:
+            skipped['inactive'] += 1
             continue
         step = 1 if cat == 'col' else 10
         dist = min_dist_to_track(lat, lon, track_pts, step=step)
@@ -1592,7 +1710,7 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
     col_pois_unsorted = [p for p in pois if p['cat'] == 'col']
 
     # Ajouter les sommets détectés sur le tracé (non couverts par OSM)
-    if track_pts_ele:
+    if do_cols and track_pts_ele:
         cum_km_list = compute_cumulative_distances(track_pts)
         gpx_peaks = detect_track_peaks(track_pts_ele, cum_km_list)
         # Rayon d'exclusion : un sommet GPX trop proche d'un col OSM est ignoré
@@ -1654,7 +1772,7 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
                 col_pois_unsorted.append(peak)
                 print(f"  Sommet GPX détecté: {peak['name']} @ {peak_km:.1f}km")
 
-    if col_pois_unsorted and track_pts_ele:
+    if do_cols and col_pois_unsorted and track_pts_ele:
         # Assigner _s_idx à tous
         for p in col_pois_unsorted:
             if '_s_idx' not in p:
@@ -1717,24 +1835,36 @@ def process_gpx(filepath, logo_path=None, title=None, sprints_csv=None):
                   f"{p.get('col_dist','?')}km / {p.get('col_denivele','?')}m / {p.get('col_pente','?')}%")
         else:
             print(f"    (non catégorisé) — {p['name']} ({p['tags'].get('ele','?')}m)")
-    print(f"  Ignorés — privé: {skipped['private']}, trop loin: {skipped['far']}")
+    print(f"  Ignorés — privé: {skipped['private']}, trop loin: {skipped['far']}, "
+          f"catégorie inactive: {skipped['inactive']}")
 
     inject_waypoints(root, pois)
 
-    out_path = filepath.replace('.gpx', '_enrichi.gpx')
+    # ─── Métadonnées d'enrichissement ────────────────────────────────────────
+    update_gpx_metadata(root, {
+        'cols': do_cols,
+        'eau': do_water,
+        'alimentation': do_food,
+        'roadbook': do_roadbook,
+    })
+
     tree.write(out_path, encoding='utf-8', xml_declaration=True)
     print(f"  Sauvegardé: {out_path}")
 
-    # Générer le PDF roadbook si des cols ou des sprints ont été trouvés
+    # Générer le PDF roadbook uniquement si --roadbook est actif
     col_pois = [p for p in pois if p['cat'] == 'col']  # col_invalid already excluded
-    if col_pois or sprint_pois:
+    if do_roadbook and (col_pois or sprint_pois):
         pdf_path = filepath.replace('.gpx', '_roadbook.pdf')
         generate_roadbook_pdf(col_pois, track_pts, track_pts_ele, filepath, pdf_path,
                               logo_path=logo_path, title=title, sprint_pois=sprint_pois)
         print_path = filepath.replace('.gpx', '_roadbook_impression.pdf')
         generate_roadbook_print_sheet(pdf_path, print_path)
-    else:
+    elif do_roadbook:
         print("  Aucun col ni sprint trouvé, pas de PDF roadbook généré.")
+    else:
+        if col_pois or sprint_pois:
+            print(f"  {len(col_pois)} col(s) / {len(sprint_pois)} sprint(s) disponibles "
+                  f"(utilisez --roadbook pour générer le PDF)")
 
     return len(pois)
 
@@ -1747,90 +1877,87 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         prog='enrichir_gpx.py',
         description=(
-            "Enrichit des fichiers GPX avec des POIs OpenStreetMap (eau potable, restaurants,\n"
-            "épiceries, cols), des sprints intermédiaires et des repères de pied d'ascension,\n"
-            "puis génère trois fichiers par GPX :\n"
-            "  • <nom>_enrichi.gpx      — fichier GPX avec waypoints POI\n"
-            "  • <nom>_roadbook.pdf     — carton 3.6×20cm à coller sur le cadre (cols + sprints)\n"
-            "  • <nom>_roadbook_impression.pdf — A4 paysage, 8 roadbooks côte à côte avec lignes de coupe"
+            "Enrichit des fichiers GPX avec des POIs OpenStreetMap.\n"
+            "Comportement par defaut : enrichissement des cols uniquement (--cols implicite).\n"
+            "Re-enrichissement : si un fichier _enrichi.gpx existe, les waypoints des\n"
+            "categories demandees sont effaces puis remplaces. Des metadonnees tracent\n"
+            "chaque enrichissement dans le GPX."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Exemples :\n"
-            "  python enrichir_gpx.py mon_trajet.gpx\n"
-            "  python enrichir_gpx.py *.gpx --titre \"Étape 1 — Col Attitude\"\n"
-            "  python enrichir_gpx.py tour.gpx --logo logo.png --titre \"Groupetto 2025\"\n"
-            "  python enrichir_gpx.py etape.gpx --sprints sprints.csv\n"
-            "  # Moyenne montagne (Ardennes) — détecter les côtes basses :\n"
-            "  python enrichir_gpx.py lbl.gpx --col-prominence 40 --col-isolation 0.8\n"
-            "\n"
-            "Dépendances :\n"
-            "  pip install requests reportlab pypdf\n"
-            "\n"
-            "Fichier de noms manuels (optionnel, prioritaire sur OSM) :\n"
-            "  Créer noms_cols.csv dans le même dossier. Deux formats de ligne :\n"
-            "    • par coordonnées :  47.9763118,6.7561008,Col de la Burotte\n"
-            "    • par kilométrage :  km,89.6,Côte de la Redoute\n"
-            "  Le format « km » est le plus simple : relevez le kilométrage\n"
-            "  affiché pour chaque « Sommet (...) » détecté, puis ajoutez une ligne.\n"
-            "\n"
-            "Sprints intermédiaires (optionnel) :\n"
-            "  • Les waypoints du GPX source portant le symbole 19 sont repris.\n"
-            "  • Un CSV « nom,km » (option --sprints, ou sprints.csv par défaut)\n"
-            "    ajoute des sprints positionnés sur le tracé.\n"
-            "  Les sprints sont écrits dans le GPX (symbole 19) et figurent dans\n"
-            "  le roadbook. Chaque pied d'ascension reçoit en plus un repère\n"
-            "  « Meilleur Grimpeur » (symbole 17)."
+            "  python enrichir_gpx.py mon_trajet.gpx               # cols seuls (defaut)\n"
+            "  python enrichir_gpx.py --water mon_trajet.gpx       # cols + eau potable\n"
+            "  python enrichir_gpx.py --food mon_trajet.gpx        # cols + restaurants/epiceries\n"
+            "  python enrichir_gpx.py --roadbook mon_trajet.gpx    # cols + PDF roadbook\n"
+            "  python enrichir_gpx.py --all mon_trajet.gpx         # tout activer\n"
+            "  python enrichir_gpx.py --all --no-water file.gpx    # tout sauf eau\n"
+            "  python enrichir_gpx.py --no-cols --water file.gpx   # eau seule\n"
+            "  python enrichir_gpx.py *.gpx --col-prominence 40 --col-isolation 0.8"
         )
     )
     parser.add_argument(
         'files', nargs='*',
-        help="Fichiers GPX à traiter. Si omis, traite tous les *.gpx du dossier courant."
+        help="Fichiers GPX a traiter (defaut : *.gpx du dossier courant)."
     )
-    parser.add_argument(
-        '--titre', metavar='TITRE',
-        help="Titre affiché en haut du roadbook PDF (défaut : nom du fichier GPX)."
-    )
-    parser.add_argument(
-        '--logo', metavar='IMAGE',
-        help="Chemin vers un logo PNG ou JPG à afficher en haut du roadbook PDF."
-    )
-    parser.add_argument(
-        '--col-prominence', type=float, metavar='M',
-        help=("Proéminence minimale (m) d'un sommet détecté sur le profil "
-              f"(défaut : {PEAK_MIN_PROMINENCE:.0f}). Baisser en moyenne "
-              "montagne (Ardennes : ~40), monter en haute montagne (~80-100).")
-    )
-    parser.add_argument(
-        '--col-altitude-min', type=float, metavar='M',
-        help=("Plancher d'altitude (m) sous lequel les sommets sont ignorés. "
-              "Par défaut aucun : indispensable pour détecter les côtes de "
-              "moyenne montagne. À fixer (p.ex. 800) en haute montagne.")
-    )
-    parser.add_argument(
-        '--col-isolation', type=float, metavar='KM',
-        help=("Distance minimale (km) entre deux sommets détectés "
-              f"(défaut : {PEAK_ISOLATION_KM:.1f}). Baisser quand les côtes "
-              "s'enchaînent (Ardennes), monter pour les regrouper.")
-    )
-    parser.add_argument(
-        '--sprints', metavar='CSV',
-        help=("Fichier CSV de sprints intermédiaires à ajouter (format : "
-              f"nom,km). Par défaut, « {SPRINTS_FILE} » est lu s'il existe. "
-              "Les sprints déjà présents dans le GPX source (symbole 19) sont "
-              "de toute façon repris.")
-    )
-    parser.add_argument(
-        '--climb-foot-strict', action='store_true',
-        help=("Affine le pied de chaque ascension : il est avancé vers le "
-              f"sommet jusqu'au premier passage de {CLIMB_FOOT_STRICT_DIST_M:.0f} m "
-              f"à au moins {CLIMB_FOOT_STRICT_GRADIENT:.0f} %% (les faux-plats "
-              "d'approche sont exclus). Sans ce drapeau, le calcul est inchangé.")
-    )
+
+    # Flags de categorie
+    cat = parser.add_argument_group("Categories d'enrichissement")
+    cat.add_argument('--cols', action='store_true', default=False,
+                     help="Enrichissement des cols (actif par defaut, flag explicite pour clarte).")
+    cat.add_argument('--no-cols', action='store_true', default=False, dest='no_cols',
+                     help="Desactive l'enrichissement des cols.")
+    cat.add_argument('--water', action='store_true', default=False,
+                     help="Points d'eau potable (fontaines, sources, robinets).")
+    cat.add_argument('--no-water', action='store_true', default=False, dest='no_water',
+                     help="Desactive la recherche d'eau (prime sur --all).")
+    cat.add_argument('--food', action='store_true', default=False,
+                     help="Restaurants, cafes, epiceries, supermarches.")
+    cat.add_argument('--no-food', action='store_true', default=False, dest='no_food',
+                     help="Desactive la recherche d'alimentation (prime sur --all).")
+    cat.add_argument('--roadbook', action='store_true', default=False,
+                     help="Genere les PDF roadbook (carton 3.6x20cm + feuille A4 impression).")
+    cat.add_argument('--no-roadbook', action='store_true', default=False, dest='no_roadbook',
+                     help="Desactive la generation PDF (prime sur --all).")
+    cat.add_argument('--all', action='store_true', default=False,
+                     help="Active tout : cols, eau, alimentation et roadbook. Les --no-* ont priorite.")
+
+    # Options de sortie
+    out = parser.add_argument_group("Options de sortie")
+    out.add_argument('--titre', metavar='TITRE',
+                     help="Titre du roadbook PDF (defaut : nom du fichier GPX).")
+    out.add_argument('--logo', metavar='IMAGE',
+                     help="Logo PNG/JPG affiche en haut du roadbook PDF.")
+    out.add_argument('--sprints', metavar='CSV',
+                     help=f"CSV de sprints intermediaires (nom,km). Defaut : {SPRINTS_FILE}.")
+
+    # Parametres de detection des cols
+    cp = parser.add_argument_group("Parametres de detection des cols")
+    cp.add_argument('--col-prominence', type=float, metavar='M',
+                    help=f"Proeminence min (m) d'un sommet (defaut : {PEAK_MIN_PROMINENCE:.0f}).")
+    cp.add_argument('--col-altitude-min', type=float, metavar='M',
+                    help="Plancher d'altitude (m), aucun par defaut.")
+    cp.add_argument('--col-isolation', type=float, metavar='KM',
+                    help=f"Distance min (km) entre deux sommets (defaut : {PEAK_ISOLATION_KM:.1f}).")
+    cp.add_argument('--climb-foot-strict', action='store_true',
+                    help=f"Affine le pied : premier passage de {CLIMB_FOOT_STRICT_DIST_M:.0f}m"
+                         f" a >= {CLIMB_FOOT_STRICT_GRADIENT:.0f}%%.")
+
     args = parser.parse_args()
 
-    # Surcharge éventuelle des paramètres de détection des cols par la ligne
-    # de commande (sinon on garde les valeurs de la section Configuration).
+    # Calcul des flags effectifs.
+    # --cols est implicite (actif par defaut). --no-cols le desactive.
+    # --all active tout ; chaque --no-* a priorite sur --all.
+    do_cols     = (not args.no_cols)
+    do_water    = (args.water    or args.all) and not args.no_water
+    do_food     = (args.food     or args.all) and not args.no_food
+    do_roadbook = (args.roadbook or args.all) and not args.no_roadbook
+
+    if not any([do_cols, do_water, do_food]):
+        print("Avertissement : aucune categorie active "
+              "-- seuls les sprints/metadonnees seront conserves.")
+
+    # Surcharge des parametres de detection des cols
     if args.col_prominence is not None:
         PEAK_MIN_PROMINENCE = args.col_prominence
     if args.col_altitude_min is not None:
@@ -1839,8 +1966,8 @@ if __name__ == '__main__':
         PEAK_ISOLATION_KM = args.col_isolation
     if args.climb_foot_strict:
         CLIMB_FOOT_STRICT = True
-        print(f"Pied d'ascension strict activé "
-              f"(≥ {CLIMB_FOOT_STRICT_GRADIENT:.0f} % sur "
+        print(f"Pied d'ascension strict active "
+              f"(>= {CLIMB_FOOT_STRICT_GRADIENT:.0f} % sur "
               f"{CLIMB_FOOT_STRICT_DIST_M:.0f} m).")
 
     files = args.files if args.files else glob.glob('*.gpx')
@@ -1848,26 +1975,40 @@ if __name__ == '__main__':
         parser.print_help()
         sys.exit(1)
 
-    # Exclure les fichiers déjà enrichis
+    # Exclure les fichiers deja enrichis (le re-enrichissement charge automatiquement
+    # le _enrichi.gpx correspondant quand on passe le fichier original)
     files = [f for f in files if '_enrichi' not in f]
 
     logo_path = args.logo
-    custom_title = args.titre if hasattr(args, "titre") else None
+    custom_title = args.titre if hasattr(args, 'titre') else None
     if logo_path and not os.path.isfile(logo_path):
         print(f"Avertissement: logo introuvable: {logo_path}")
         logo_path = None
 
-    print(f"Traitement de {len(files)} fichier(s) GPX...")
+    flags_str = []
+    if do_cols:     flags_str.append('--cols')
+    if do_water:    flags_str.append('--water')
+    if do_food:     flags_str.append('--food')
+    if do_roadbook: flags_str.append('--roadbook')
+    print(f"Traitement de {len(files)} fichier(s) GPX..."
+          f" [{' '.join(flags_str) if flags_str else 'aucun'}]")
     if logo_path:
         print(f"Logo: {logo_path}")
 
     total = 0
     for i, f in enumerate(files):
-        total += process_gpx(f, logo_path=logo_path, title=custom_title,
-                              sprints_csv=args.sprints) or 0
+        total += process_gpx(f,
+                              logo_path=logo_path,
+                              title=custom_title,
+                              sprints_csv=args.sprints,
+                              do_cols=do_cols,
+                              do_water=do_water,
+                              do_food=do_food,
+                              do_roadbook=do_roadbook) or 0
         if i < len(files) - 1:
-            time.sleep(1)  # pause entre requêtes Overpass
+            time.sleep(1)  # pause entre requetes Overpass
 
-    print(f"\nTerminé ! {total} POIs ajoutés au total.")
+    print(f"\nTermine ! {total} POIs ajoutes au total.")
     print("Les fichiers enrichis ont le suffixe '_enrichi.gpx'")
-    print("Les roadbooks PDF ont le suffixe '_roadbook.pdf'")
+    if do_roadbook:
+        print("Les roadbooks PDF ont le suffixe '_roadbook.pdf'")
