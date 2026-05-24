@@ -41,7 +41,7 @@ SPRINTS_FILE        = "sprints.csv"    # fichier CSV optionnel: nom,km (sprints 
 # (proéminence + dénivelé via classify_col), et non plus par l'altitude
 # absolue : une côte de 150 m à 8 % est un col, qu'elle culmine à 300 m ou
 # à 1500 m.
-PEAK_MIN_PROMINENCE = 50      # proéminence minimale d'un sommet (m) : hauteur
+PEAK_MIN_PROMINENCE = 30      # proéminence minimale d'un sommet (m) : hauteur
                               #   dont il dépasse le creux le plus haut de part
                               #   et d'autre. Filtre le bruit GPS et les faux
                               #   plats. Baisser pour la moyenne montagne.
@@ -75,7 +75,7 @@ PEAK_TWIN_MIN_DROP  = 12      # creux minimal (m) exigé entre deux tels jumeaux
 # montée. Sans le drapeau, le comportement reste strictement inchangé.
 CLIMB_FOOT_STRICT          = False   # activé par --climb-foot-strict
 CLIMB_FOOT_STRICT_DIST_M   = 100.0   # longueur du passage de contrôle (m)
-CLIMB_FOOT_STRICT_GRADIENT = 3.0     # pente minimale de ce passage (%)
+CLIMB_FOOT_STRICT_GRADIENT = 4.0     # pente minimale de ce passage (%)
 
 # ─── Creux intermédiaire toléré dans une ascension ───────────────────────────
 # Une ascension peut comporter un creux intermédiaire (faux-plat descendant,
@@ -104,7 +104,7 @@ COL_FLAT_MAX_GRADIENT = 3.0    # pente moyenne maxi d'un tel replat (%)
 # est ignorée — un long faux-plat à 1 % n'est pas une ascension.
 COL_MIN_DENIVELE = 30.0   # dénivelé minimal (m)
 COL_MIN_LENGTH   = 100.0  # longueur minimale (m)
-COL_MIN_GRADIENT = 4.0    # pente moyenne minimale (%)
+COL_MIN_GRADIENT = 3.0    # pente moyenne minimale (%)
 
 # ─── Nommage des cols / côtes détectés ───────────────────────────────────────
 # Mots-clés qui, présents dans le nom OSM d'une voie ou d'un lieu, indiquent
