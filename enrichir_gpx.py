@@ -41,7 +41,7 @@ SPRINTS_FILE        = "sprints.csv"    # fichier CSV optionnel: nom,km (sprints 
 # (proéminence + dénivelé via classify_col), et non plus par l'altitude
 # absolue : une côte de 150 m à 8 % est un col, qu'elle culmine à 300 m ou
 # à 1500 m.
-PEAK_MIN_PROMINENCE = 30      # proéminence minimale d'un sommet (m) : hauteur
+PEAK_MIN_PROMINENCE = 50      # proéminence minimale d'un sommet (m) : hauteur
                               #   dont il dépasse le creux le plus haut de part
                               #   et d'autre. Filtre le bruit GPS et les faux
                               #   plats. Baisser pour la moyenne montagne.
